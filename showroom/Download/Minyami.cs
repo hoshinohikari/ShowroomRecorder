@@ -1,12 +1,15 @@
 ﻿using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Serilog;
 
 namespace showroom.Download;
 
 public class Minyami(string name, string url) : DownloadUtils(name, url)
 {
+    private const int SIGINT = 2;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private Task _downloadTask = null!;
+    private Timer _outputTimer = null!;
     private Process _process = null!;
 
     public override async Task DownloadAsync()
@@ -35,7 +38,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             var startInfo = new ProcessStartInfo
             {
                 FileName = "minyami",
-                Arguments = $"-d {Url} -o {outputFilePath} --live",
+                Arguments = $"-d {Url} -o {outputFilePath} --retries 1 --live",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -43,12 +46,23 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             };
 
             _process = new Process { StartInfo = startInfo };
-            _process.OutputDataReceived += (sender, args) => Log.Verbose(args.Data!);
-            _process.ErrorDataReceived += (sender, args) => Log.Verbose(args.Data!);
+            _process.OutputDataReceived += (sender, args) =>
+            {
+                Log.Verbose(args.Data!);
+                ResetOutputTimer();
+            };
+            _process.ErrorDataReceived += (sender, args) =>
+            {
+                Log.Verbose(args.Data!);
+                ResetOutputTimer();
+            };
 
             _process.Start();
             _process.BeginOutputReadLine();
             _process.BeginErrorReadLine();
+
+            // 初始化计时器
+            _outputTimer = new Timer(OutputTimerCallback, null, TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
 
             _downloadTask = Task.Run(() => _process.WaitForExit(), _cancellationTokenSource.Token);
             await _downloadTask;
@@ -76,10 +90,46 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         }
     }
 
+    private void ResetOutputTimer()
+    {
+        _outputTimer.Change(TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
+    }
+
+    private void OutputTimerCallback(object? state)
+    {
+        if (!_process.HasExited)
+        {
+            Log.Warning("Minyami 在5秒内没有任何输出，发送Ctrl+C信号终止进程。");
+            SendCtrlC(_process);
+        }
+    }
+
+    private void SendCtrlC(Process process)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // Windows 平台发送 Ctrl+C 信号
+            GenerateConsoleCtrlEvent(ConsoleCtrlEvent.CTRL_C, (uint)process.SessionId);
+        else
+            // Unix 平台发送 SIGINT 信号
+            kill(process.Id, SIGINT);
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GenerateConsoleCtrlEvent(ConsoleCtrlEvent sigevent, uint dwProcessGroupId);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kill(int pid, int sig);
+
     public override void Stop()
     {
         if (_cancellationTokenSource.IsCancellationRequested) return;
         _cancellationTokenSource.Cancel();
         if (!_process.HasExited) _process.Kill();
+    }
+
+    private enum ConsoleCtrlEvent
+    {
+        CTRL_C = 0,
+        CTRL_BREAK = 1
     }
 }
