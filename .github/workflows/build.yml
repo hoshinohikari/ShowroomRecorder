@@ -16,21 +16,21 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            dotnet-version: '9.0.x'
+            dotnet-version: '9.x'
             rid: 'linux-x64'
           - os: windows-latest
-            dotnet-version: '9.0.x'
+            dotnet-version: '9.x'
             rid: 'win-x64'
           - os: macos-latest
-            dotnet-version: '9.0.x'
+            dotnet-version: '9.x'
             rid: 'osx-x64'
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v2
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ matrix.dotnet-version }}
 
