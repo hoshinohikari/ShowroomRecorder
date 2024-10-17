@@ -1,0 +1,50 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            dotnet-version: '9.0.x'
+            rid: 'linux-x64'
+          - os: windows-latest
+            dotnet-version: '9.0.x'
+            rid: 'win-x64'
+          - os: macos-latest
+            dotnet-version: '9.0.x'
+            rid: 'osx-x64'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Publish
+        run: dotnet publish --configuration Release --no-build --output ./publish --runtime ${{ matrix.rid }} --self-contained true /p:PublishSingleFile=true
+
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ matrix.os }}-publish
+          path: ./publish
