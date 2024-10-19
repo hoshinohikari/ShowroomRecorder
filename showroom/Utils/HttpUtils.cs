@@ -28,7 +28,7 @@ public class HttpUtils
         var options = new RestClientOptions(ip)
         {
             ThrowOnAnyError = true,
-            Timeout = TimeSpan.FromSeconds(30), // 2 second
+            Timeout = TimeSpan.FromSeconds(ConfigUtils.Config.Interval), // 15 second
             AutomaticDecompression =
                 DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
             //AutomaticDecompression = DecompressionMethods.GZip

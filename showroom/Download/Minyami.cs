@@ -38,7 +38,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             var startInfo = new ProcessStartInfo
             {
                 FileName = "minyami",
-                Arguments = $"-d {Url} -o {outputFilePath} --retries 1 --live",
+                Arguments = $"-d {Url} -o {outputFilePath} --retries 2 --live",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -46,12 +46,12 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             };
 
             _process = new Process { StartInfo = startInfo };
-            _process.OutputDataReceived += (sender, args) =>
+            _process.OutputDataReceived += (_, args) =>
             {
                 Log.Verbose(args.Data!);
                 ResetOutputTimer();
             };
-            _process.ErrorDataReceived += (sender, args) =>
+            _process.ErrorDataReceived += (_, args) =>
             {
                 Log.Verbose(args.Data!);
                 ResetOutputTimer();
@@ -62,7 +62,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             _process.BeginErrorReadLine();
 
             // 初始化计时器
-            _outputTimer = new Timer(OutputTimerCallback, null, TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
+            _outputTimer = new Timer(OutputTimerCallback, null, TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
 
             _downloadTask = Task.Run(() => _process.WaitForExit(), _cancellationTokenSource.Token);
             await _downloadTask;
@@ -92,14 +92,14 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
 
     private void ResetOutputTimer()
     {
-        _outputTimer.Change(TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
+        _outputTimer.Change(TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
     }
 
     private void OutputTimerCallback(object? state)
     {
         if (!_process.HasExited)
         {
-            Log.Warning("Minyami 在5秒内没有任何输出，发送Ctrl+C信号终止进程。");
+            Log.Warning("Minyami 在10秒内没有任何输出，发送Ctrl+C信号终止进程。");
             SendCtrlC(_process);
         }
     }

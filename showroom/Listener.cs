@@ -68,28 +68,34 @@ public class Listener
     private async Task Listen()
     {
         while (_isStarting)
-        {
-            if (await IsLiving())
-            {
-                Log.Information($"{_name} begin living");
-                _recorder = new Recorder(_name, _id);
-                await _recorder.Start();
-            }
-            else
-            {
-                Log.Debug($"{_name} not living");
-            }
-
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
+                if (await IsLiving())
+                {
+                    Log.Information($"{_name} begin living");
+                    _recorder = new Recorder(_name, _id);
+                    await _recorder.Start();
+                    continue;
+                }
+
+                Log.Debug($"{_name} not living");
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    Log.Debug("Task.Delay 被取消");
+                    break;
+                }
             }
-            catch (TaskCanceledException)
+            catch (Exception ex)
             {
-                Log.Debug("Task.Delay 被取消");
-                break;
+                Log.Error($"{_name} Listen error: {ex}");
             }
-        }
+
+        Log.Warning($"{_name} stop");
     }
 
     public async Task Stop()
