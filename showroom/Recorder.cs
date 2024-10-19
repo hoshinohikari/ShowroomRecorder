@@ -25,6 +25,12 @@ public class Recorder(string name, long id)
 
         Log.Debug($"GetUrls \"{res.Item2}\"");
 
+        if (res.Item2 == "{}")
+        {
+            _recordUrl = string.Empty;
+            return;
+        }
+
         using var document = JsonDocument.Parse(res.Item2);
         var root = document.RootElement;
 
@@ -42,6 +48,12 @@ public class Recorder(string name, long id)
     public async Task Start()
     {
         await GetUrls();
+
+        if (_recordUrl == string.Empty)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval));
+            return;
+        }
 
         Log.Information($"{name} Record url is {_recordUrl}");
         //Log.Information($"{_name} view url is {_viewUrl}");
