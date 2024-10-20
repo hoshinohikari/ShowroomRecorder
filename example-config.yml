@@ -1,0 +1,7 @@
+DebugLog: false
+FileLog: false
+Interval: 20
+Downloader: ffmpeg
+Users: 
+- user1
+- user2
