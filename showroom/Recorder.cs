@@ -63,6 +63,9 @@ public class Recorder(string name, long id)
             case "minyami":
                 _download = new Minyami(name, _recordUrl);
                 break;
+            case "streamlink":
+                _download = new StreamlinkUtils(name, _recordUrl);
+                break;
             case "ffmpeg":
             default:
                 _download = new FFmpegUtils(name, _recordUrl);
