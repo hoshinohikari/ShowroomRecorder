@@ -38,7 +38,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             var startInfo = new ProcessStartInfo
             {
                 FileName = "minyami",
-                Arguments = $"-d {Url} -o {outputFilePath} --retries 2 --live",
+                Arguments = $"-d {Url} -o {outputFilePath} --temp-dir {outputDirectory} --timeout 5 --retries 5 --live",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -53,7 +53,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             };
             _process.ErrorDataReceived += (_, args) =>
             {
-                Log.Verbose(args.Data!);
+                Log.Warning(args.Data!);
                 ResetOutputTimer();
             };
 
@@ -70,23 +70,23 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             switch (_process.ExitCode)
             {
                 case 0:
-                    Log.Information($"下载完成: {outputFilePath}");
+                    Log.Information($"{Name} 下载完成: {outputFilePath}");
                     break;
                 case 137:
-                    Log.Warning($"下载已取消，存于{outputFilePath}");
+                    Log.Warning($"{Name} 下载已取消，存于{outputFilePath}");
                     break;
                 default:
-                    Log.Error($"下载失败，退出代码: {_process.ExitCode}");
+                    Log.Error($"{Name} 下载失败，退出代码: {_process.ExitCode}");
                     break;
             }
         }
         catch (OperationCanceledException)
         {
-            Log.Warning($"下载已取消，存于{outputFilePath}");
+            Log.Warning($"{Name} 下载已取消，存于{outputFilePath}");
         }
         catch (Exception ex)
         {
-            Log.Error($"下载失败: {ex}");
+            Log.Error($"{Name} 下载失败: {ex}");
         }
     }
 
@@ -120,11 +120,28 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int pid, int sig);
 
-    public override void Stop()
+    public override async Task Stop()
     {
         if (_cancellationTokenSource.IsCancellationRequested) return;
-        _cancellationTokenSource.Cancel();
-        if (!_process.HasExited) _process.Kill();
+        await _cancellationTokenSource.CancelAsync();
+
+        if (_process.HasExited) return;
+        var delayTask = Task.Delay(TimeSpan.FromSeconds(60));
+        var processExitTask = Task.Run(() => _process.WaitForExit());
+
+        var completedTask = await Task.WhenAny(delayTask, processExitTask);
+
+        Log.Information($"{Name} 进程停止");
+
+        if (completedTask == delayTask)
+        {
+            Log.Warning($"{Name} 进程在60秒内未结束，强制终止进程。");
+            _process.Kill();
+        }
+        else
+        {
+            Log.Information($"{Name} 进程在60秒内正常结束。");
+        }
     }
 
     private enum ConsoleCtrlEvent

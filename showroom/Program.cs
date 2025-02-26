@@ -22,12 +22,12 @@ if (ConfigUtils.Config.FileLog)
 
 Log.Logger = loggerConfig.CreateLogger();
 
-Log.Verbose("hello");
+/*Log.Verbose("hello");
 Log.Debug("hello");
 Log.Information("hello");
 Log.Warning("hello");
 Log.Error("hello");
-Log.Fatal("hello");
+Log.Fatal("hello");*/
 
 // 初始化监听器列表
 var listeners = ConfigUtils.Config.Users.Select(n => new Listener(n)).ToList();

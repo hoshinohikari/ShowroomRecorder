@@ -58,15 +58,21 @@ public class Recorder(string name, long id)
         Log.Information($"{name} Record url is {_recordUrl}");
         //Log.Information($"{_name} view url is {_viewUrl}");
 
-        if (ConfigUtils.Config.Downloader == "ffmpeg")
-            _download = new FFmpegUtils(name, _recordUrl);
-        else
-            _download = new Minyami(name, _recordUrl);
+        switch (ConfigUtils.Config.Downloader)
+        {
+            case "minyami":
+                _download = new Minyami(name, _recordUrl);
+                break;
+            case "ffmpeg":
+            default:
+                _download = new FFmpegUtils(name, _recordUrl);
+                break;
+        }
         await _download.DownloadAsync();
     }
 
-    public void Stop()
+    public async Task Stop()
     {
-        _download?.Stop();
+        await _download?.Stop()!;
     }
 }

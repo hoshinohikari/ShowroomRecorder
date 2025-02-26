@@ -70,6 +70,8 @@ public class Listener
         while (_isStarting)
             try
             {
+                Log.Debug($"{_name} test living");
+
                 if (await IsLiving())
                 {
                     Log.Information($"{_name} begin living");
@@ -100,9 +102,17 @@ public class Listener
 
     public async Task Stop()
     {
-        _isStarting = false;
-        _recorder?.Stop();
-        await _cancellationTokenSource.CancelAsync();
-        await _task;
+        try
+        {
+            _isStarting = false;
+            if (_recorder != null)
+                await _recorder?.Stop()!;
+            await _cancellationTokenSource.CancelAsync();
+            await _task;
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"{_name} Listen stop error: {ex}");
+        }
     }
 }

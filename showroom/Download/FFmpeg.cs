@@ -67,8 +67,8 @@ public class FFmpegUtils(string name, string url) : DownloadUtils(name, url)
         }
     }
 
-    public override void Stop()
+    public override async Task Stop()
     {
-        _cancellationTokenSource.Cancel();
+        await _cancellationTokenSource.CancelAsync();
     }
 }

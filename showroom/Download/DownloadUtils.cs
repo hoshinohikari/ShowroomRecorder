@@ -8,5 +8,5 @@ public abstract class DownloadUtils(string name, string url)
     // 定义一个抽象的异步download方法
     public abstract Task DownloadAsync();
 
-    public abstract void Stop();
+    public abstract Task Stop();
 }
