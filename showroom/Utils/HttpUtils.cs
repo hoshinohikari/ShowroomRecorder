@@ -19,6 +19,21 @@ public static class ShowroomHttp
     }
 }
 
+public static class ShowroomDownloadHttp
+{
+    private static readonly HttpUtils HttpUtils;
+
+    static ShowroomDownloadHttp()
+    {
+        HttpUtils = new HttpUtils("https://hls-css.live.showroom-live.com");
+    }
+
+    public static async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param)
+    {
+        return await HttpUtils.Get(resource, param);
+    }
+}
+
 public class HttpUtils
 {
     private readonly RestClient _client;
@@ -28,7 +43,6 @@ public class HttpUtils
         var options = new RestClientOptions(ip)
         {
             ThrowOnAnyError = true,
-            Timeout = TimeSpan.FromSeconds(ConfigUtils.Config.Interval), // 15 second
             AutomaticDecompression =
                 DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
             //AutomaticDecompression = DecompressionMethods.GZip
@@ -36,9 +50,20 @@ public class HttpUtils
         _client = new RestClient(options);
     }
 
-    public async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param)
+    public async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param, double? timeoutMs = null)
     {
         var request = new RestRequest(resource);
+    
+        // 如果提供了超时参数，则设置请求级别的超时
+        if (timeoutMs.HasValue)
+        {
+            request.Timeout = TimeSpan.FromMilliseconds(timeoutMs.Value);
+        }
+        else
+        {
+            // 否则使用默认超时
+            request.Timeout = TimeSpan.FromSeconds(ConfigUtils.Config.Interval);
+        }
 
         request.AddHeaders(new Dictionary<string, string>
         {
