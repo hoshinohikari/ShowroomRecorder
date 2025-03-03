@@ -1,5 +1,6 @@
-﻿using Serilog;
-using System.Diagnostics;
+﻿using System.Diagnostics;
+using Serilog;
+using showroom.Utils;
 
 namespace showroom.Download;
 
@@ -30,12 +31,20 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
             var outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
             if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
             outputFilePath = Path.Combine(outputDirectory, $"{Name}_{timestamp}.ts");
+            var args =
+                $"-4 -o {outputFilePath} --retry-streams 2 --stream-segment-threads 5 --stream-segment-timeout 1 --retry-open 6 --stream-timeout 5";
+            if (ConfigUtils.Config.FileLog)
+            {
+                var logDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+                if (!Directory.Exists(logDirectory)) Directory.CreateDirectory(logDirectory);
+                args += $" --loglevel all --logfile {Path.Combine(logDirectory, $"{Name}_{timestamp}.log")}";
+            }
 
             // 使用Minyami下载m3u8流并保存到本地
             var startInfo = new ProcessStartInfo
             {
                 FileName = "streamlink",
-                Arguments = $"-4 -o {outputFilePath} --retry-streams 1 --retry-max 3 --stream-segment-threads 5 --stream-segment-timeout 5 --stream-timeout 5 {Url} best",
+                Arguments = $"{args} {Url} best",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -43,14 +52,8 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
             };
 
             _process = new Process { StartInfo = startInfo };
-            _process.OutputDataReceived += (_, args) =>
-            {
-                Log.Verbose(args.Data!);
-            };
-            _process.ErrorDataReceived += (_, args) =>
-            {
-                Log.Warning(args.Data!);
-            };
+            _process.OutputDataReceived += (_, dataReceivedEventArgs) => { Log.Verbose(dataReceivedEventArgs.Data!); };
+            _process.ErrorDataReceived += (_, dataReceivedEventArgs) => { Log.Warning(dataReceivedEventArgs.Data!); };
 
             _process.Start();
             _process.BeginOutputReadLine();

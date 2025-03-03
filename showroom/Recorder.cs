@@ -67,10 +67,13 @@ public class Recorder(string name, long id)
                 _download = new StreamlinkUtils(name, _recordUrl);
                 break;
             case "ffmpeg":
-            default:
                 _download = new FFmpegUtils(name, _recordUrl);
                 break;
+            default:
+                _download = new ShowroomUtils(name, _recordUrl);
+                break;
         }
+
         await _download.DownloadAsync();
     }
 

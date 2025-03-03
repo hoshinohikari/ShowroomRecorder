@@ -13,9 +13,10 @@ public static class ShowroomHttp
         HttpUtils = new HttpUtils("https://www.showroom-live.com");
     }
 
-    public static async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param)
+    public static async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param,
+        double? timeoutMs = null)
     {
-        return await HttpUtils.Get(resource, param);
+        return await HttpUtils.Get(resource, param, timeoutMs);
     }
 }
 
@@ -28,9 +29,10 @@ public static class ShowroomDownloadHttp
         HttpUtils = new HttpUtils("https://hls-css.live.showroom-live.com");
     }
 
-    public static async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param)
+    public static async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param,
+        double? timeoutMs = null)
     {
-        return await HttpUtils.Get(resource, param);
+        return await HttpUtils.Get(resource, param, timeoutMs);
     }
 }
 
@@ -50,20 +52,18 @@ public class HttpUtils
         _client = new RestClient(options);
     }
 
-    public async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param, double? timeoutMs = null)
+    public async Task<(HttpStatusCode, string)> Get(string resource, List<(string, string)> param,
+        double? timeoutMs = null)
     {
-        var request = new RestRequest(resource);
-    
-        // 如果提供了超时参数，则设置请求级别的超时
-        if (timeoutMs.HasValue)
+        var request = new RestRequest(resource)
         {
-            request.Timeout = TimeSpan.FromMilliseconds(timeoutMs.Value);
-        }
-        else
-        {
-            // 否则使用默认超时
-            request.Timeout = TimeSpan.FromSeconds(ConfigUtils.Config.Interval);
-        }
+            // 如果提供了超时参数，则设置请求级别的超时
+            Timeout = timeoutMs.HasValue
+                ? TimeSpan.FromMilliseconds(timeoutMs.Value)
+                :
+                // 否则使用默认超时
+                TimeSpan.FromSeconds(ConfigUtils.Config.Interval)
+        };
 
         request.AddHeaders(new Dictionary<string, string>
         {
