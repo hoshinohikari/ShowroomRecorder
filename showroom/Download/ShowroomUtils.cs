@@ -3,33 +3,71 @@ using System.Net;
 using Serilog;
 using showroom.Utils;
 using SimpleM3U8Parser;
+using System.Text.RegularExpressions;
+using SimpleM3U8Parser.Media;
 
 namespace showroom.Download;
 
 public class ShowroomUtils : DownloadUtils
 {
     private readonly CancellationTokenSource _cancellationTokenSource = new();
-    private readonly HashSet<string> _downloadedSegments = []; // 用于跟踪已下载的片段，避免重复
-    private readonly SemaphoreSlim _downloadSemaphore = new(5); // 限制同时处理的最大片段数为5
+    private readonly HashSet<string> _downloadedSegments = []; // Track downloaded segment paths
+    private readonly SemaphoreSlim _downloadSemaphore = new(8); // Limit max concurrent downloads to 8
     private readonly string _outputDirectory;
-    private readonly ConcurrentQueue<ShowroomSegment> _segmentsQueue = new();
+    private readonly ConcurrentQueue<M3u8Media> _segmentsQueue = new();
+    private readonly ConcurrentDictionary<long, byte[]> _downloadedSegmentsCache = new(); // Store downloaded but not yet merged segments
     private Task? _downloadTask;
     private Task? _fetchTask;
+    private Task? _mergeTask; // New: merge thread
     private bool _isDownloading;
+    private readonly SemaphoreSlim _fileLock = new(1); // Ensure thread-safe file writing
+    private string _combinedFilePath = null!; // Merged file path
+    private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
+    private long _lastProcessedSequence = -1; // Track the maximum sequence number processed
+    private static readonly Regex SequenceNumberRegex = new Regex(@"-(\d+)\.ts", RegexOptions.Compiled); // Extract sequence number from path
+    private volatile bool _stopFetchingM3u8 = false;
+    private volatile bool _stopDownloading = false;
+    private readonly ManualResetEventSlim _fetchCompletedEvent = new(false);
+    private readonly ManualResetEventSlim _downloadCompletedEvent = new(false);
+    private readonly ManualResetEventSlim _firstBlockDownloadedEvent = new(false);
+    private int _nonContinuousRetryCount = 0;
+    private long _waitingForSequence = -1;
 
     public ShowroomUtils(string name, string url) : base(name, url)
     {
-        // 设置输出目录
+        // Set output directory
         _outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
         if (!Directory.Exists(_outputDirectory)) Directory.CreateDirectory(_outputDirectory);
+
+        // Create new output file
+        CreateNewOutputFile();
+    }
+
+    // Create new output file
+    private void CreateNewOutputFile()
+    {
+        var timestamp = DateTime.Now.ToString("yyyy_MM_dd_HH_mm_ss_fff");
+        _combinedFilePath = Path.Combine(_outputDirectory, $"{Name}_{timestamp}.ts");
+        Log.Information($"Creating new output file: {_combinedFilePath}");
+    }
+
+    // Extract sequence number from segment path
+    private long ExtractSequenceNumber(string path)
+    {
+        var match = SequenceNumberRegex.Match(path);
+        if (match.Success && long.TryParse(match.Groups[1].Value, out var sequenceNumber))
+        {
+            return sequenceNumber;
+        }
+        return -1; // Unable to extract sequence number
     }
 
     /// <summary>
-    ///     从URL中提取路径部分
+    ///     Extract path portion from URL
     /// </summary>
-    /// <param name="url">完整URL</param>
-    /// <param name="includeQuery">是否包含查询参数</param>
-    /// <returns>URL的路径部分</returns>
+    /// <param name="url">Complete URL</param>
+    /// <param name="includeQuery">Whether to include query parameters</param>
+    /// <returns>Path portion of the URL</returns>
     private static string ExtractPathFromUrl(string url, bool includeQuery = false)
     {
         if (string.IsNullOrEmpty(url))
@@ -38,7 +76,7 @@ public class ShowroomUtils : DownloadUtils
         if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
             return includeQuery ? uri.PathAndQuery : uri.AbsolutePath;
 
-        // 如果URL格式无效，返回原始字符串
+        // If URL format is invalid, return the original string
         return url;
     }
 
@@ -48,19 +86,182 @@ public class ShowroomUtils : DownloadUtils
         {
             _isDownloading = true;
 
-            // 初始化下载任务
+            // Initialize download task
             _downloadTask = Task.Run(ProcessDownloadQueueAsync);
 
-            // 初始化m3u8获取任务
+            // Initialize m3u8 fetch task
             _fetchTask = Task.Run(FetchM3u8ContentAsync);
 
-            // 任务已在后台启动，可以立即返回
-            await _fetchTask;
-            await _downloadTask;
+            // Delayed initialization of merge task - wait for first block download
+            _mergeTask = Task.Run(async () =>
+            {
+                // Wait for first block download signal, timeout after 30 seconds
+                bool firstBlockDownloaded = await Task.Run(() => _firstBlockDownloadedEvent.Wait(30000));
+
+                if (firstBlockDownloaded)
+                {
+                    // First block downloaded, wait additional 2 seconds
+                    Log.Information("First segment downloaded, waiting 2 seconds before starting merge process...");
+                    await Task.Delay(2000, _cancellationTokenSource.Token);
+
+                    // Start merge process
+                    await MergeSegmentsAsync();
+                }
+                else
+                {
+                    Log.Warning("Timeout waiting for first segment download, starting merge process anyway");
+                    await MergeSegmentsAsync();
+                }
+            });
+
+            await Task.WhenAll(_fetchTask, _downloadTask, _mergeTask);
         }
         catch (Exception ex)
         {
-            Log.Error($"初始化下载过程时出错: {ex.Message}");
+            Log.Error($"Error initializing download process: {ex}");
+        }
+    }
+
+    private async Task MergeSegmentsAsync()
+    {
+        try
+        {
+            while (!_cancellationTokenSource.IsCancellationRequested &&
+               (!_downloadCompletedEvent.IsSet || _downloadedSegmentsCache.Count > 0))
+            {
+                // Check if there are new segments to merge
+                if (_downloadedSegmentsCache.Count > 0)
+                {
+                    // Get all available sequence numbers and sort them
+                    var availableSequences = _downloadedSegmentsCache.Keys.OrderBy(k => k).ToList();
+
+                    if (availableSequences.Count > 0)
+                    {
+                        Log.Debug($"Pending segments: {availableSequences.Count}, sequence range: {availableSequences.First()}-{availableSequences.Last()}");
+                    }
+
+                    // Start merging from the smallest sequence number
+                    foreach (var seqNumber in availableSequences)
+                    {
+                        // Skip segments with sequence numbers smaller than already processed ones (likely delayed segments)
+                        if (_lastSequenceNumber > 0 && seqNumber < _lastSequenceNumber)
+                        {
+                            if (_downloadedSegmentsCache.TryRemove(seqNumber, out _))
+                            {
+                                Log.Warning($"Discarding expired segment: sequence {seqNumber} < already processed {_lastSequenceNumber}");
+                            }
+                            continue;
+                        }
+
+                        // If this is the first segment, or a consecutive sequence number
+                        if (_lastSequenceNumber == -1 || seqNumber == _lastSequenceNumber + 1)
+                        {
+                            // If we found the sequence number we were waiting for, reset retry counter
+                            if (_waitingForSequence > 0 && seqNumber == _waitingForSequence)
+                            {
+                                Log.Debug($"Found waiting sequence {seqNumber}, resetting retry counter");
+                                _nonContinuousRetryCount = 0;
+                                _waitingForSequence = -1;
+                            }
+
+                            // Try to get segment from cache
+                            if (_downloadedSegmentsCache.TryRemove(seqNumber, out var segmentData))
+                            {
+                                await _fileLock.WaitAsync(_cancellationTokenSource.Token);
+                                try
+                                {
+                                    // Write to file
+                                    await using var fileStream = new FileStream(
+                                        _combinedFilePath,
+                                        FileMode.Append,
+                                        FileAccess.Write,
+                                        FileShare.Read);
+
+                                    await fileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
+
+                                    // Update last processed sequence number
+                                    _lastSequenceNumber = seqNumber;
+                                    Log.Debug($"Merged segment: sequence {seqNumber}, {segmentData.Length} bytes");
+                                }
+                                finally
+                                {
+                                    _fileLock.Release();
+                                }
+                            }
+                        }
+                        else if (seqNumber > _lastSequenceNumber + 1)
+                        {
+                            // Detected non-continuous sequence
+                            _nonContinuousRetryCount++;
+
+                            // Set the sequence number we're waiting for
+                            if (_waitingForSequence == -1)
+                            {
+                                _waitingForSequence = _lastSequenceNumber + 1;
+                                Log.Debug($"Detected non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, waiting for {_waitingForSequence}, retry {_nonContinuousRetryCount}/3");
+                            }
+
+                            // Only create a new file after three retries
+                            if (_nonContinuousRetryCount >= 3)
+                            {
+                                // Detected non-continuous sequence, create new file
+                                Log.Warning($"After 3 retries, still non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, gap {seqNumber - _lastSequenceNumber - 1}, creating new file");
+                                await _fileLock.WaitAsync(_cancellationTokenSource.Token);
+                                try
+                                {
+                                    // Create new file
+                                    CreateNewOutputFile();
+
+                                    // Write current segment
+                                    if (_downloadedSegmentsCache.TryRemove(seqNumber, out var segmentData))
+                                    {
+                                        await using var fileStream = new FileStream(
+                                            _combinedFilePath,
+                                            FileMode.Append,
+                                            FileAccess.Write,
+                                            FileShare.Read);
+
+                                        await fileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
+
+                                        // Update last processed sequence number
+                                        _lastSequenceNumber = seqNumber;
+                                        Log.Debug($"Merged segment to new file: sequence {seqNumber}, {segmentData.Length} bytes");
+                                    }
+
+                                    // Reset retry counter and waiting sequence number
+                                    _nonContinuousRetryCount = 0;
+                                    _waitingForSequence = -1;
+                                }
+                                finally
+                                {
+                                    _fileLock.Release();
+                                }
+
+                                // Current sequence has been processed, break loop to continue with other segments
+                                break;
+                            }
+                            else
+                            {
+                                // Not reached maximum retry count, exit this loop and wait for next check
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Wait before checking again
+                await Task.Delay(2000, _cancellationTokenSource.Token);
+            }
+
+            Log.Information("All segments merged successfully");
+        }
+        catch (OperationCanceledException)
+        {
+            Log.Warning("Merge processing cancelled");
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Error during merge process: {ex}");
         }
     }
 
@@ -68,66 +269,141 @@ public class ShowroomUtils : DownloadUtils
     {
         try
         {
-            // 继续获取m3u8内容，直到取消
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            int retryCount = 0; // Initialize retry counter
+            TimeSpan defaultWaitTime = TimeSpan.FromSeconds(4); // Default wait time of 4 seconds
+            TimeSpan waitTime = defaultWaitTime; // Initial wait time
+
+            // Continue fetching m3u8 content until cancelled or max retries reached
+            while (!_cancellationTokenSource.IsCancellationRequested && !_stopFetchingM3u8)
+            {
                 try
                 {
                     var m3u8Content =
-                        await ShowroomDownloadHttp.Get(ExtractPathFromUrl(Url), new List<(string, string)>());
+                        await ShowroomDownloadHttp.Get(ExtractPathFromUrl(Url), new List<(string, string)>(), 2000);
 
                     if (m3u8Content.Item1 != HttpStatusCode.OK)
                     {
-                        Log.Error($"无法获取m3u8内容，状态码: {m3u8Content.Item1}");
+                        Log.Error($"Unable to fetch m3u8 content, status code: {m3u8Content.Item1}");
 
-                        // 短暂等待后重试
+                        // Increment retry counter
+                        retryCount++;
+                        Log.Warning($"M3u8 fetch failed, retry {retryCount}/5");
+
+                        // If max retry count reached, the stream has likely ended
+                        if (retryCount >= 5)
+                        {
+                            Log.Information("Failed to fetch 5 consecutive times, stream may have ended");
+
+                            // Set stop flags to begin shutdown process
+                            _stopFetchingM3u8 = true;
+
+                            // When stream ends, signal to stop downloading
+                            // Note: This will let the download queue complete existing content before stopping
+                            _stopDownloading = true;
+
+                            break;
+                        }
+
+                        // Short delay before retry
                         await Task.Delay(1000, _cancellationTokenSource.Token);
                         continue;
                     }
 
+                    // Successfully fetched m3u8 content, reset retry counter
+                    retryCount = 0;
+
                     var m3u8 = M3u8Parser.Parse(m3u8Content.Item2);
                     var newSegments = 0;
+                    double totalMediaDuration = 0; // Total duration of all media segments in seconds
 
-                    // 将新的片段添加到队列
+                    // Add new segments to queue
                     foreach (var segment in m3u8.Medias)
                     {
-                        // 检查是否已经下载过该片段（通过Path匹配）
-                        if (_downloadedSegments.Contains(segment.Path)) continue;
-                        _segmentsQueue.Enqueue(new ShowroomSegment
+                        // Accumulate segment duration (assuming segment has Duration property in seconds)
+                        // Note: If M3u8Media doesn't directly provide Duration, adjust based on actual implementation
+                        if (segment.Duration > 0)
                         {
-                            Path = segment.Path,
-                            Duration = segment.Duration,
-                            Downloaded = false
-                        });
+                            totalMediaDuration += segment.Duration;
+                        }
+
+                        // Check if segment has already been downloaded (match by Path)
+                        if (_downloadedSegments.Contains(segment.Path)) continue;
+                        _segmentsQueue.Enqueue(segment);
 
                         newSegments++;
                     }
 
-                    if (newSegments > 0) Log.Debug($"添加了 {newSegments} 个新片段到下载队列，当前队列长度: {_segmentsQueue.Count}");
+                    if (newSegments > 0)
+                        Log.Debug($"Added {newSegments} new segments to download queue, current queue length: {_segmentsQueue.Count}");
 
-                    // 根据配置的间隔时间等待
-                    await Task.Delay(TimeSpan.FromMilliseconds(4000), _cancellationTokenSource.Token);
+                    // Calculate dynamic wait time: half of total duration, but not less than 1s and not more than 10s
+                    if (totalMediaDuration > 0)
+                    {
+                        waitTime = TimeSpan.FromSeconds(Math.Min(Math.Max(totalMediaDuration / 2, 1), 10));
+                        Log.Debug($"Calculated wait time based on media duration: {waitTime.TotalSeconds:F1}s (total media duration: {totalMediaDuration:F1}s)");
+                    }
+                    else
+                    {
+                        // Use default value if unable to calculate duration
+                        waitTime = defaultWaitTime;
+                        Log.Debug($"Using default wait time: {waitTime.TotalSeconds:F1}s");
+                    }
+
+                    // Wait according to calculated interval
+                    await Task.Delay(waitTime, _cancellationTokenSource.Token);
                 }
                 catch (OperationCanceledException)
                 {
-                    // 取消操作，直接退出循环
+                    // Operation cancelled, exit loop
                     break;
                 }
                 catch (Exception ex)
                 {
-                    Log.Error($"获取m3u8内容出错: {ex.Message}");
+                    Log.Error($"Error fetching m3u8 content: {ex}");
 
-                    // 出错后短暂等待，避免快速重试导致资源浪费
+                    // Increment retry counter (exceptions also count as retries)
+                    retryCount++;
+                    Log.Warning($"M3u8 fetch exception, retry {retryCount}/5");
+
+                    // If max retry count reached, the stream has likely ended
+                    if (retryCount >= 5)
+                    {
+                        Log.Information("Failed to fetch 5 consecutive times, stream may have ended");
+
+                        // Set stop flags to begin shutdown process
+                        _stopFetchingM3u8 = true;
+
+                        // When stream ends, signal to stop downloading
+                        _stopDownloading = true;
+
+                        break;
+                    }
+
+                    // Short delay before retry
                     await Task.Delay(1000, _cancellationTokenSource.Token);
                 }
+            }
         }
         catch (OperationCanceledException)
         {
-            // 任务被取消
-            Log.Information("m3u8获取任务已取消");
+            Log.Information("M3u8 fetch task cancelled");
         }
         catch (Exception ex)
         {
-            Log.Error($"m3u8获取任务发生未处理异常: {ex}");
+            Log.Error($"Unhandled exception in m3u8 fetch task: {ex}");
+        }
+        finally
+        {
+            // Ensure download stop flag is set when m3u8 fetch completes
+            if (!_stopDownloading)
+            {
+                _stopDownloading = true;
+                Log.Information("M3u8 fetching ended, marking download queue to complete remaining items");
+            }
+
+            // Signal that m3u8 fetching is complete
+            _fetchCompletedEvent.Set();
+            Log.Information("M3u8 fetching stopped");
         }
     }
 
@@ -135,29 +411,37 @@ public class ShowroomUtils : DownloadUtils
     {
         try
         {
-            // 创建任务列表跟踪所有下载任务
+            // Create task list to track all download tasks
             List<Task> activeTasks = [];
 
-            // 从队列中获取片段并下载
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            // Get segments and download until cancelled or stop flag is set and queue is empty
+            while (!_cancellationTokenSource.IsCancellationRequested &&
+                  (!_stopDownloading || !_segmentsQueue.IsEmpty))
             {
-                // 先清理已完成的任务
+                // First clean up completed tasks
                 activeTasks.RemoveAll(t => t.IsCompleted);
 
-                // 如果队列为空，等待一段时间后再检查
+                // If queue is empty, wait for a while before checking again
                 if (_segmentsQueue.IsEmpty)
                 {
+                    // If m3u8 fetch has stopped and queue is empty, end download task
+                    if (_fetchCompletedEvent.IsSet)
+                    {
+                        Log.Information("M3u8 fetch has stopped and download queue is empty, ending download task");
+                        break;
+                    }
+
                     await Task.Delay(500, _cancellationTokenSource.Token);
                     continue;
                 }
 
-                // 尝试从队列中取出片段
+                // Try to dequeue a segment
                 if (_segmentsQueue.TryDequeue(out var segment))
                 {
-                    // 等待获取信号量，限制并发数
+                    // Wait for semaphore to limit concurrency
                     await _downloadSemaphore.WaitAsync(_cancellationTokenSource.Token);
 
-                    // 启动新任务下载片段
+                    // Start new task to download segment
                     var downloadTask = Task.Run(async () =>
                     {
                         try
@@ -166,7 +450,7 @@ public class ShowroomUtils : DownloadUtils
                         }
                         finally
                         {
-                            // 释放信号量，允许新的下载任务启动
+                            // Release semaphore to allow new download tasks
                             _downloadSemaphore.Release();
                         }
                     }, _cancellationTokenSource.Token);
@@ -174,59 +458,130 @@ public class ShowroomUtils : DownloadUtils
                     activeTasks.Add(downloadTask);
                 }
 
-                // 如果活动任务太多，等待一些任务完成
+                // If too many active tasks, wait for some to complete
                 if (activeTasks.Count > 20) await Task.WhenAny(activeTasks);
             }
 
-            // 等待所有剩余任务完成
+            // Wait for all remaining tasks to complete
             if (activeTasks.Count > 0) await Task.WhenAll(activeTasks);
 
-            Log.Information("所有片段下载已完成或取消");
+            Log.Information("All segment downloads completed or cancelled");
         }
         catch (OperationCanceledException)
         {
-            Log.Warning("下载处理已取消");
+            Log.Warning("Download processing cancelled");
         }
         catch (Exception ex)
         {
-            Log.Error($"下载处理过程中发生错误: {ex}");
+            Log.Error($"Error during download processing: {ex}");
+        }
+        finally
+        {
+            // Signal that downloading is completed
+            _downloadCompletedEvent.Set();
+            Log.Information("All downloads completed");
         }
     }
 
-    private async Task DownloadSegmentAsync(ShowroomSegment segment)
+    private async Task DownloadSegmentAsync(M3u8Media segment)
     {
-        try
+        // Maximum retry attempts
+        const int maxRetries = 3;
+        int retryCount = 0;
+
+        // Extract filename for logging
+        var fileName = Path.GetFileName(segment.Path);
+        if (string.IsNullOrEmpty(fileName)) fileName = $"segment_{Guid.NewGuid()}.ts";
+
+        // Extract sequence number
+        var currentSequence = ExtractSequenceNumber(segment.Path);
+
+        while (retryCount <= maxRetries)
         {
-            // 从URL中获取文件名或使用唯一标识符
-            var fileName = Path.GetFileName(segment.Path);
-            if (string.IsNullOrEmpty(fileName)) fileName = $"segment_{Guid.NewGuid()}.ts";
-
-            var outputPath = Path.Combine(_outputDirectory, fileName);
-
-            // 下载m3u8片段
-            var response = await ShowroomDownloadHttp.Get(
-                ExtractPathFromUrl(segment.Path, true),
-                new List<(string, string)>(),
-                5000); // 设置5秒超时
-
-            if (response.Item1 == HttpStatusCode.OK && !string.IsNullOrEmpty(response.Item2))
+            try
             {
-                // 将内容写入文件
-                await File.WriteAllTextAsync(outputPath, response.Item2, _cancellationTokenSource.Token);
+                // If this is not the first attempt, log retry information
+                if (retryCount > 0)
+                {
+                    Log.Warning($"Retrying download for segment: {fileName} (sequence: {currentSequence}), attempt {retryCount}/{maxRetries}");
+                }
 
-                // 记录此片段已下载，避免重复
-                _downloadedSegments.Add(segment.Path);
+                // Download m3u8 segment
+                var segmentBytes = await ShowroomDownloadHttp.DownloadFile(
+                    ExtractPathFromUrl(segment.Path, true),
+                    new List<(string, string)>(),
+                    2000); // 2 second timeout
 
-                Log.Debug($"成功下载片段: {fileName}");
+                // Download successful
+                if (segmentBytes != null && segmentBytes.Length > 0)
+                {
+                    // Only cache segments with recognizable sequence numbers
+                    if (currentSequence > 0)
+                    {
+                        // Add segment to cache
+                        _downloadedSegmentsCache.TryAdd(currentSequence, segmentBytes);
+
+                        // Update maximum processed sequence number
+                        if (currentSequence > _lastProcessedSequence)
+                        {
+                            _lastProcessedSequence = currentSequence;
+                        }
+
+                        // Signal that first block has been downloaded (if not already set)
+                        if (!_firstBlockDownloadedEvent.IsSet)
+                        {
+                            _firstBlockDownloadedEvent.Set();
+                            Log.Debug("First segment downloaded signal set");
+                        }
+                    }
+
+                    // Mark segment as downloaded
+                    _downloadedSegments.Add(segment.Path);
+
+                    // Special log if retry was successful
+                    if (retryCount > 0)
+                    {
+                        Log.Information($"Successfully downloaded segment after {retryCount} retries: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
+                    }
+                    else
+                    {
+                        Log.Debug($"Successfully downloaded segment: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
+                    }
+
+                    // Download successful, exit loop
+                    return;
+                }
+                else
+                {
+                    // No data received, increase retry counter
+                    retryCount++;
+
+                    if (retryCount > maxRetries)
+                    {
+                        Log.Warning($"Failed to download segment after {maxRetries} attempts: {fileName}, no data received");
+                        break;
+                    }
+
+                    // Wait before retrying
+                    await Task.Delay(500 * retryCount, _cancellationTokenSource.Token); // Incremental wait time
+                }
             }
-            else
+            catch (Exception ex)
             {
-                Log.Warning($"下载片段失败: {fileName}, 状态码: {response.Item1}");
+                // Increase retry counter
+                retryCount++;
+
+                if (retryCount > maxRetries)
+                {
+                    Log.Error($"Error downloading segment after {maxRetries} attempts: {segment.Path}, error: {ex}");
+                    break;
+                }
+
+                Log.Warning($"Error downloading segment (attempt {retryCount}/{maxRetries}): {segment.Path}, error: {ex}");
+
+                // Wait before retrying
+                await Task.Delay(500 * retryCount, _cancellationTokenSource.Token); // Incremental wait time
             }
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"下载片段时发生错误: {segment.Path}, 错误: {ex.Message}");
         }
     }
 
@@ -234,49 +589,71 @@ public class ShowroomUtils : DownloadUtils
     {
         if (_isDownloading)
         {
-            // 取消所有任务
-            await _cancellationTokenSource.CancelAsync();
-
-            // 等待任务结束
-            if (_downloadTask != null)
-                try
-                {
-                    // 设置超时，避免无限等待
-                    var timeoutTask = Task.Delay(5000);
-                    await Task.WhenAny(_downloadTask, timeoutTask);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"停止下载任务时发生错误: {ex.Message}");
-                }
-
-            if (_fetchTask != null)
-                try
-                {
-                    // 设置超时，避免无限等待
-                    var timeoutTask = Task.Delay(5000);
-                    await Task.WhenAny(_fetchTask, timeoutTask);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"停止m3u8获取任务时发生错误: {ex.Message}");
-                }
-
-            // 清空队列
-            while (_segmentsQueue.TryDequeue(out _))
+            try
             {
+                Log.Information($"Starting to stop download for {Name}...");
+
+                // Phase 1: Stop fetching new m3u8
+                _stopFetchingM3u8 = true;
+                Log.Information("Stopping new M3u8 segment fetching...");
+
+                // Wait for m3u8 fetching to complete (max 5 seconds)
+                await Task.Run(() => _fetchCompletedEvent.Wait(5000));
+
+                // Phase 2: Stop adding new download tasks but let existing ones complete
+                _stopDownloading = true;
+                Log.Information("Waiting for existing download tasks to complete...");
+
+                // Wait for downloads to complete (max 30 seconds)
+                await Task.Run(() => _downloadCompletedEvent.Wait(30000));
+
+                // Phase 3: Wait for all segments to be merged (max 10 seconds)
+                if (_downloadedSegmentsCache.Count > 0)
+                {
+                    Log.Information($"Waiting for {_downloadedSegmentsCache.Count} segments to be merged...");
+                    foreach (var seq in _downloadedSegmentsCache.Keys)
+                    {
+                        Log.Debug($"Waiting for sequence {seq} to be merged...");
+                    }
+                    await Task.Delay(10000); // Give merging process up to 10 seconds
+                }
+
+                // Final phase: Cancel all remaining tasks
+                await _cancellationTokenSource.CancelAsync();
+
+                // Wait for tasks to fully end
+                var tasks = new List<Task?> { _downloadTask, _fetchTask, _mergeTask };
+                foreach (var task in tasks.Where(t => t != null))
+                {
+                    try
+                    {
+                        var timeoutTask = Task.Delay(2000);
+                        await Task.WhenAny(task!, timeoutTask);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"Error stopping task: {ex}");
+                    }
+                }
+
+                // Clear queue and cache
+                while (_segmentsQueue.TryDequeue(out _)) { }
+                _downloadedSegmentsCache.Clear();
+
+                // Reset events
+                _fetchCompletedEvent.Reset();
+                _downloadCompletedEvent.Reset();
+                _firstBlockDownloadedEvent.Reset();
+
+                _isDownloading = false;
+                Log.Information($"Download for {Name} has completely stopped");
             }
-
-            _isDownloading = false;
-
-            Log.Information($"{Name} 的下载已停止");
+            catch (Exception ex)
+            {
+                Log.Error($"Error during stop process: {ex}");
+                // Ensure download status is set to false
+                _isDownloading = false;
+            }
         }
     }
-}
-
-public struct ShowroomSegment
-{
-    public string Path { get; set; }
-    public double Duration { get; set; }
-    public bool Downloaded { get; set; }
 }
