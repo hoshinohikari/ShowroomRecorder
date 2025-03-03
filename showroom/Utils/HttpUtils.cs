@@ -34,6 +34,12 @@ public static class ShowroomDownloadHttp
     {
         return await HttpUtils.Get(resource, param, timeoutMs);
     }
+
+    public static async Task<byte[]> DownloadFile(string resource, List<(string, string)> param,
+        double? timeoutMs = null)
+    {
+        return await HttpUtils.DownloadFile(resource, param, timeoutMs);
+    }
 }
 
 public class HttpUtils
@@ -67,18 +73,10 @@ public class HttpUtils
 
         request.AddHeaders(new Dictionary<string, string>
         {
-            {
-                "Accept", "*/*"
-            },
-            {
-                "Accept-Encoding", "gzip, deflate, br, zstd"
-            },
-            {
-                "Accept-Language", "en-US,en;q=0.9,ja;q=0.8,ja-JP;q=0.7,zh-CN;q=0.6,zh;q=0.5"
-            },
-            {
-                "Connection", "keep-alive"
-            },
+            { "Accept", "*/*" },
+            { "Accept-Encoding", "gzip, deflate, br, zstd" },
+            { "Accept-Language", "en-US,en;q=0.9,ja;q=0.8,ja-JP;q=0.7,zh-CN;q=0.6,zh;q=0.5" },
+            { "Connection", "keep-alive" },
             {
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -93,5 +91,34 @@ public class HttpUtils
 
         Log.Error(response.ErrorMessage!);
         return (response.StatusCode, null)!;
+    }
+
+    public async Task<byte[]> DownloadFile(string resource, List<(string, string)> param,
+        double? timeoutMs = null)
+    {
+        var request = new RestRequest(resource)
+        {
+            Timeout = timeoutMs.HasValue
+                ? TimeSpan.FromMilliseconds(timeoutMs.Value)
+                : TimeSpan.FromSeconds(ConfigUtils.Config.Interval)
+        };
+
+        request.AddHeaders(new Dictionary<string, string>
+        {
+            { "Accept", "*/*" },
+            { "Accept-Encoding", "gzip, deflate, br, zstd" },
+            { "Accept-Language", "en-US,en;q=0.9,ja;q=0.8,ja-JP;q=0.7,zh-CN;q=0.6,zh;q=0.5" },
+            { "Connection", "keep-alive" },
+            {
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            }
+        });
+
+        foreach (var p in param) request.AddParameter(p.Item1, p.Item2);
+
+        var response = await _client.DownloadDataAsync(request);
+
+        return response!;
     }
 }

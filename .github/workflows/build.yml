@@ -23,7 +23,7 @@ jobs:
             rid: 'win-x64'
           - os: macos-latest
             dotnet-version: '9.x'
-            rid: 'osx-x64'
+            rid: 'osx-arm64'
 
     steps:
       - name: Checkout code
