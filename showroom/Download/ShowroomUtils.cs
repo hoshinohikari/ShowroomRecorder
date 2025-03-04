@@ -1,36 +1,41 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text.RegularExpressions;
 using Serilog;
 using showroom.Utils;
 using SimpleM3U8Parser;
-using System.Text.RegularExpressions;
 using SimpleM3U8Parser.Media;
 
 namespace showroom.Download;
 
 public class ShowroomUtils : DownloadUtils
 {
+    private static readonly Regex
+        SequenceNumberRegex = new(@"-(\d+)\.ts", RegexOptions.Compiled); // Extract sequence number from path
+
     private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly ManualResetEventSlim _downloadCompletedEvent = new(false);
     private readonly HashSet<string> _downloadedSegments = []; // Track downloaded segment paths
+
+    private readonly ConcurrentDictionary<long, byte[]>
+        _downloadedSegmentsCache = new(); // Store downloaded but not yet merged segments
+
     private readonly SemaphoreSlim _downloadSemaphore = new(8); // Limit max concurrent downloads to 8
+    private readonly ManualResetEventSlim _fetchCompletedEvent = new(false);
+    private readonly SemaphoreSlim _fileLock = new(1); // Ensure thread-safe file writing
+    private readonly ManualResetEventSlim _firstBlockDownloadedEvent = new(false);
     private readonly string _outputDirectory;
     private readonly ConcurrentQueue<M3u8Media> _segmentsQueue = new();
-    private readonly ConcurrentDictionary<long, byte[]> _downloadedSegmentsCache = new(); // Store downloaded but not yet merged segments
+    private string _combinedFilePath = null!; // Merged file path
     private Task? _downloadTask;
     private Task? _fetchTask;
-    private Task? _mergeTask; // New: merge thread
     private bool _isDownloading;
-    private readonly SemaphoreSlim _fileLock = new(1); // Ensure thread-safe file writing
-    private string _combinedFilePath = null!; // Merged file path
-    private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
     private long _lastProcessedSequence = -1; // Track the maximum sequence number processed
-    private static readonly Regex SequenceNumberRegex = new Regex(@"-(\d+)\.ts", RegexOptions.Compiled); // Extract sequence number from path
-    private volatile bool _stopFetchingM3u8 = false;
-    private volatile bool _stopDownloading = false;
-    private readonly ManualResetEventSlim _fetchCompletedEvent = new(false);
-    private readonly ManualResetEventSlim _downloadCompletedEvent = new(false);
-    private readonly ManualResetEventSlim _firstBlockDownloadedEvent = new(false);
-    private int _nonContinuousRetryCount = 0;
+    private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
+    private Task? _mergeTask; // New: merge thread
+    private int _nonContinuousRetryCount;
+    private volatile bool _stopDownloading;
+    private volatile bool _stopFetchingM3u8;
     private long _waitingForSequence = -1;
 
     public ShowroomUtils(string name, string url) : base(name, url)
@@ -55,10 +60,7 @@ public class ShowroomUtils : DownloadUtils
     private long ExtractSequenceNumber(string path)
     {
         var match = SequenceNumberRegex.Match(path);
-        if (match.Success && long.TryParse(match.Groups[1].Value, out var sequenceNumber))
-        {
-            return sequenceNumber;
-        }
+        if (match.Success && long.TryParse(match.Groups[1].Value, out var sequenceNumber)) return sequenceNumber;
         return -1; // Unable to extract sequence number
     }
 
@@ -96,7 +98,7 @@ public class ShowroomUtils : DownloadUtils
             _mergeTask = Task.Run(async () =>
             {
                 // Wait for first block download signal, timeout after 30 seconds
-                bool firstBlockDownloaded = await Task.Run(() => _firstBlockDownloadedEvent.Wait(30000));
+                var firstBlockDownloaded = await Task.Run(() => _firstBlockDownloadedEvent.Wait(30000));
 
                 if (firstBlockDownloaded)
                 {
@@ -127,7 +129,7 @@ public class ShowroomUtils : DownloadUtils
         try
         {
             while (!_cancellationTokenSource.IsCancellationRequested &&
-               (!_downloadCompletedEvent.IsSet || _downloadedSegmentsCache.Count > 0))
+                   (!_downloadCompletedEvent.IsSet || _downloadedSegmentsCache.Count > 0))
             {
                 // Check if there are new segments to merge
                 if (_downloadedSegmentsCache.Count > 0)
@@ -136,9 +138,8 @@ public class ShowroomUtils : DownloadUtils
                     var availableSequences = _downloadedSegmentsCache.Keys.OrderBy(k => k).ToList();
 
                     if (availableSequences.Count > 0)
-                    {
-                        Log.Debug($"Pending segments: {availableSequences.Count}, sequence range: {availableSequences.First()}-{availableSequences.Last()}");
-                    }
+                        Log.Debug(
+                            $"Pending segments: {availableSequences.Count}, sequence range: {availableSequences.First()}-{availableSequences.Last()}");
 
                     // Start merging from the smallest sequence number
                     foreach (var seqNumber in availableSequences)
@@ -147,9 +148,8 @@ public class ShowroomUtils : DownloadUtils
                         if (_lastSequenceNumber > 0 && seqNumber < _lastSequenceNumber)
                         {
                             if (_downloadedSegmentsCache.TryRemove(seqNumber, out _))
-                            {
-                                Log.Warning($"Discarding expired segment: sequence {seqNumber} < already processed {_lastSequenceNumber}");
-                            }
+                                Log.Warning(
+                                    $"Discarding expired segment: sequence {seqNumber} < already processed {_lastSequenceNumber}");
                             continue;
                         }
 
@@ -198,14 +198,16 @@ public class ShowroomUtils : DownloadUtils
                             if (_waitingForSequence == -1)
                             {
                                 _waitingForSequence = _lastSequenceNumber + 1;
-                                Log.Debug($"Detected non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, waiting for {_waitingForSequence}, retry {_nonContinuousRetryCount}/3");
+                                Log.Debug(
+                                    $"Detected non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, waiting for {_waitingForSequence}, retry {_nonContinuousRetryCount}/3");
                             }
 
                             // Only create a new file after three retries
                             if (_nonContinuousRetryCount >= 3)
                             {
                                 // Detected non-continuous sequence, create new file
-                                Log.Warning($"After 3 retries, still non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, gap {seqNumber - _lastSequenceNumber - 1}, creating new file");
+                                Log.Warning(
+                                    $"After 3 retries, still non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, gap {seqNumber - _lastSequenceNumber - 1}, creating new file");
                                 await _fileLock.WaitAsync(_cancellationTokenSource.Token);
                                 try
                                 {
@@ -225,7 +227,8 @@ public class ShowroomUtils : DownloadUtils
 
                                         // Update last processed sequence number
                                         _lastSequenceNumber = seqNumber;
-                                        Log.Debug($"Merged segment to new file: sequence {seqNumber}, {segmentData.Length} bytes");
+                                        Log.Debug(
+                                            $"Merged segment to new file: sequence {seqNumber}, {segmentData.Length} bytes");
                                     }
 
                                     // Reset retry counter and waiting sequence number
@@ -238,13 +241,10 @@ public class ShowroomUtils : DownloadUtils
                                 }
 
                                 // Current sequence has been processed, break loop to continue with other segments
-                                break;
                             }
-                            else
-                            {
-                                // Not reached maximum retry count, exit this loop and wait for next check
-                                break;
-                            }
+
+                            // Not reached maximum retry count, exit this loop and wait for next check
+                            break;
                         }
                     }
                 }
@@ -269,13 +269,11 @@ public class ShowroomUtils : DownloadUtils
     {
         try
         {
-            int retryCount = 0; // Initialize retry counter
-            TimeSpan defaultWaitTime = TimeSpan.FromSeconds(4); // Default wait time of 4 seconds
-            TimeSpan waitTime = defaultWaitTime; // Initial wait time
+            var retryCount = 0; // Initialize retry counter
+            var defaultWaitTime = TimeSpan.FromSeconds(4); // Default wait time of 4 seconds
 
             // Continue fetching m3u8 content until cancelled or max retries reached
             while (!_cancellationTokenSource.IsCancellationRequested && !_stopFetchingM3u8)
-            {
                 try
                 {
                     var m3u8Content =
@@ -321,10 +319,7 @@ public class ShowroomUtils : DownloadUtils
                     {
                         // Accumulate segment duration (assuming segment has Duration property in seconds)
                         // Note: If M3u8Media doesn't directly provide Duration, adjust based on actual implementation
-                        if (segment.Duration > 0)
-                        {
-                            totalMediaDuration += segment.Duration;
-                        }
+                        if (segment.Duration > 0) totalMediaDuration += segment.Duration;
 
                         // Check if segment has already been downloaded (match by Path)
                         if (_downloadedSegments.Contains(segment.Path)) continue;
@@ -334,13 +329,16 @@ public class ShowroomUtils : DownloadUtils
                     }
 
                     if (newSegments > 0)
-                        Log.Debug($"Added {newSegments} new segments to download queue, current queue length: {_segmentsQueue.Count}");
+                        Log.Debug(
+                            $"Added {newSegments} new segments to download queue, current queue length: {_segmentsQueue.Count}");
 
                     // Calculate dynamic wait time: half of total duration, but not less than 1s and not more than 10s
+                    TimeSpan waitTime; // Initial wait time
                     if (totalMediaDuration > 0)
                     {
                         waitTime = TimeSpan.FromSeconds(Math.Min(Math.Max(totalMediaDuration / 2, 1), 10));
-                        Log.Debug($"Calculated wait time based on media duration: {waitTime.TotalSeconds:F1}s (total media duration: {totalMediaDuration:F1}s)");
+                        Log.Debug(
+                            $"Calculated wait time based on media duration: {waitTime.TotalSeconds:F1}s (total media duration: {totalMediaDuration:F1}s)");
                     }
                     else
                     {
@@ -382,7 +380,6 @@ public class ShowroomUtils : DownloadUtils
                     // Short delay before retry
                     await Task.Delay(1000, _cancellationTokenSource.Token);
                 }
-            }
         }
         catch (OperationCanceledException)
         {
@@ -416,7 +413,7 @@ public class ShowroomUtils : DownloadUtils
 
             // Get segments and download until cancelled or stop flag is set and queue is empty
             while (!_cancellationTokenSource.IsCancellationRequested &&
-                  (!_stopDownloading || !_segmentsQueue.IsEmpty))
+                   (!_stopDownloading || !_segmentsQueue.IsEmpty))
             {
                 // First clean up completed tasks
                 activeTasks.RemoveAll(t => t.IsCompleted);
@@ -487,7 +484,7 @@ public class ShowroomUtils : DownloadUtils
     {
         // Maximum retry attempts
         const int maxRetries = 3;
-        int retryCount = 0;
+        var retryCount = 0;
 
         // Extract filename for logging
         var fileName = Path.GetFileName(segment.Path);
@@ -496,15 +493,13 @@ public class ShowroomUtils : DownloadUtils
         // Extract sequence number
         var currentSequence = ExtractSequenceNumber(segment.Path);
 
-        while (retryCount <= maxRetries)
-        {
+        while (true)
             try
             {
                 // If this is not the first attempt, log retry information
                 if (retryCount > 0)
-                {
-                    Log.Warning($"Retrying download for segment: {fileName} (sequence: {currentSequence}), attempt {retryCount}/{maxRetries}");
-                }
+                    Log.Warning(
+                        $"Retrying download for segment: {fileName} (sequence: {currentSequence}), attempt {retryCount}/{maxRetries}");
 
                 // Download m3u8 segment
                 var segmentBytes = await ShowroomDownloadHttp.DownloadFile(
@@ -513,7 +508,7 @@ public class ShowroomUtils : DownloadUtils
                     2000); // 2 second timeout
 
                 // Download successful
-                if (segmentBytes != null && segmentBytes.Length > 0)
+                if (segmentBytes is { Length: > 0 })
                 {
                     // Only cache segments with recognizable sequence numbers
                     if (currentSequence > 0)
@@ -522,10 +517,7 @@ public class ShowroomUtils : DownloadUtils
                         _downloadedSegmentsCache.TryAdd(currentSequence, segmentBytes);
 
                         // Update maximum processed sequence number
-                        if (currentSequence > _lastProcessedSequence)
-                        {
-                            _lastProcessedSequence = currentSequence;
-                        }
+                        if (currentSequence > _lastProcessedSequence) _lastProcessedSequence = currentSequence;
 
                         // Signal that first block has been downloaded (if not already set)
                         if (!_firstBlockDownloadedEvent.IsSet)
@@ -540,31 +532,28 @@ public class ShowroomUtils : DownloadUtils
 
                     // Special log if retry was successful
                     if (retryCount > 0)
-                    {
-                        Log.Information($"Successfully downloaded segment after {retryCount} retries: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
-                    }
+                        Log.Information(
+                            $"Successfully downloaded segment after {retryCount} retries: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
                     else
-                    {
-                        Log.Debug($"Successfully downloaded segment: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
-                    }
+                        Log.Debug(
+                            $"Successfully downloaded segment: {fileName} (sequence: {currentSequence}, {segmentBytes.Length} bytes)");
 
                     // Download successful, exit loop
                     return;
                 }
-                else
+
+                // No data received, increase retry counter
+                retryCount++;
+
+                if (retryCount > maxRetries)
                 {
-                    // No data received, increase retry counter
-                    retryCount++;
-
-                    if (retryCount > maxRetries)
-                    {
-                        Log.Warning($"Failed to download segment after {maxRetries} attempts: {fileName}, no data received");
-                        break;
-                    }
-
-                    // Wait before retrying
-                    await Task.Delay(500 * retryCount, _cancellationTokenSource.Token); // Incremental wait time
+                    Log.Warning(
+                        $"Failed to download segment after {maxRetries} attempts: {fileName}, no data received");
+                    break;
                 }
+
+                // Wait before retrying
+                await Task.Delay(500 * retryCount, _cancellationTokenSource.Token); // Incremental wait time
             }
             catch (Exception ex)
             {
@@ -577,18 +566,17 @@ public class ShowroomUtils : DownloadUtils
                     break;
                 }
 
-                Log.Warning($"Error downloading segment (attempt {retryCount}/{maxRetries}): {segment.Path}, error: {ex}");
+                Log.Warning(
+                    $"Error downloading segment (attempt {retryCount}/{maxRetries}): {segment.Path}, error: {ex}");
 
                 // Wait before retrying
                 await Task.Delay(500 * retryCount, _cancellationTokenSource.Token); // Incremental wait time
             }
-        }
     }
 
     public override async Task Stop()
     {
         if (_isDownloading)
-        {
             try
             {
                 Log.Information($"Starting to stop download for {Name}...");
@@ -612,9 +600,7 @@ public class ShowroomUtils : DownloadUtils
                 {
                     Log.Information($"Waiting for {_downloadedSegmentsCache.Count} segments to be merged...");
                     foreach (var seq in _downloadedSegmentsCache.Keys)
-                    {
                         Log.Debug($"Waiting for sequence {seq} to be merged...");
-                    }
                     await Task.Delay(10000); // Give merging process up to 10 seconds
                 }
 
@@ -624,7 +610,6 @@ public class ShowroomUtils : DownloadUtils
                 // Wait for tasks to fully end
                 var tasks = new List<Task?> { _downloadTask, _fetchTask, _mergeTask };
                 foreach (var task in tasks.Where(t => t != null))
-                {
                     try
                     {
                         var timeoutTask = Task.Delay(2000);
@@ -634,10 +619,12 @@ public class ShowroomUtils : DownloadUtils
                     {
                         Log.Error($"Error stopping task: {ex}");
                     }
-                }
 
                 // Clear queue and cache
-                while (_segmentsQueue.TryDequeue(out _)) { }
+                while (_segmentsQueue.TryDequeue(out _))
+                {
+                }
+
                 _downloadedSegmentsCache.Clear();
 
                 // Reset events
@@ -654,6 +641,5 @@ public class ShowroomUtils : DownloadUtils
                 // Ensure download status is set to false
                 _isDownloading = false;
             }
-        }
     }
 }
