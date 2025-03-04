@@ -368,7 +368,7 @@ public class ShowroomUtils : DownloadUtils
                     TimeSpan waitTime; // Initial wait time
                     if (totalMediaDuration > 0)
                     {
-                        waitTime = TimeSpan.FromSeconds(Math.Min(Math.Max(totalMediaDuration / 2, 1), 10));
+                        waitTime = TimeSpan.FromSeconds(Math.Min(Math.Max(totalMediaDuration / 2 - 1.0, 1), 10));
                         Log.Debug(
                             $"Calculated wait time based on media duration: {waitTime.TotalSeconds:F1}s (total media duration: {totalMediaDuration:F1}s)");
                     }
