@@ -1,7 +1,7 @@
 DebugLog: false
 FileLog: false
 Interval: 20
-Downloader: ffmpeg
+Downloader: none
 Users: 
 - user1
 - user2
