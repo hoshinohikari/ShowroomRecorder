@@ -126,8 +126,19 @@ public class ShowroomUtils : DownloadUtils
 
     private async Task MergeSegmentsAsync()
     {
+        FileStream? currentFileStream = null;
+
         try
         {
+            // 在开始合并线程时打开文件流
+            currentFileStream = new FileStream(
+                _combinedFilePath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.Read);
+
+            Log.Debug($"File stream opened for: {_combinedFilePath}");
+
             while (!_cancellationTokenSource.IsCancellationRequested &&
                    (!_downloadCompletedEvent.IsSet || _downloadedSegmentsCache.Count > 0))
             {
@@ -170,14 +181,8 @@ public class ShowroomUtils : DownloadUtils
                                 await _fileLock.WaitAsync(_cancellationTokenSource.Token);
                                 try
                                 {
-                                    // Write to file
-                                    await using var fileStream = new FileStream(
-                                        _combinedFilePath,
-                                        FileMode.Append,
-                                        FileAccess.Write,
-                                        FileShare.Read);
-
-                                    await fileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
+                                    // 使用已打开的文件流写入
+                                    await currentFileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
 
                                     // Update last processed sequence number
                                     _lastSequenceNumber = seqNumber;
@@ -211,19 +216,26 @@ public class ShowroomUtils : DownloadUtils
                                 await _fileLock.WaitAsync(_cancellationTokenSource.Token);
                                 try
                                 {
+                                    // 关闭当前文件流
+                                    await currentFileStream.FlushAsync(_cancellationTokenSource.Token);
+                                    await currentFileStream.DisposeAsync();
+
                                     // Create new file
                                     CreateNewOutputFile();
+
+                                    // 打开新文件流
+                                    currentFileStream = new FileStream(
+                                        _combinedFilePath,
+                                        FileMode.Append,
+                                        FileAccess.Write,
+                                        FileShare.Read);
+
+                                    Log.Debug($"New file stream opened for: {_combinedFilePath}");
 
                                     // Write current segment
                                     if (_downloadedSegmentsCache.TryRemove(seqNumber, out var segmentData))
                                     {
-                                        await using var fileStream = new FileStream(
-                                            _combinedFilePath,
-                                            FileMode.Append,
-                                            FileAccess.Write,
-                                            FileShare.Read);
-
-                                        await fileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
+                                        await currentFileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
 
                                         // Update last processed sequence number
                                         _lastSequenceNumber = seqNumber;
@@ -262,6 +274,28 @@ public class ShowroomUtils : DownloadUtils
         catch (Exception ex)
         {
             Log.Error($"Error during merge process: {ex}");
+        }
+        finally
+        {
+            // 确保在任务结束时关闭文件流
+            if (currentFileStream != null)
+            {
+                await _fileLock.WaitAsync();
+                try
+                {
+                    await currentFileStream.FlushAsync();
+                    await currentFileStream.DisposeAsync();
+                    Log.Debug($"File stream closed for: {_combinedFilePath}");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"Error closing file stream: {ex.Message}");
+                }
+                finally
+                {
+                    _fileLock.Release();
+                }
+            }
         }
     }
 
