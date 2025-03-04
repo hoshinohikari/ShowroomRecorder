@@ -176,22 +176,20 @@ public class ShowroomUtils : DownloadUtils
                             }
 
                             // Try to get segment from cache
-                            if (_downloadedSegmentsCache.TryRemove(seqNumber, out var segmentData))
+                            if (!_downloadedSegmentsCache.TryRemove(seqNumber, out var segmentData)) continue;
+                            await _fileLock.WaitAsync(_cancellationTokenSource.Token);
+                            try
                             {
-                                await _fileLock.WaitAsync(_cancellationTokenSource.Token);
-                                try
-                                {
-                                    // 使用已打开的文件流写入
-                                    await currentFileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
+                                // 使用已打开的文件流写入
+                                await currentFileStream.WriteAsync(segmentData, _cancellationTokenSource.Token);
 
-                                    // Update last processed sequence number
-                                    _lastSequenceNumber = seqNumber;
-                                    Log.Debug($"Merged segment: sequence {seqNumber}, {segmentData.Length} bytes");
-                                }
-                                finally
-                                {
-                                    _fileLock.Release();
-                                }
+                                // Update last processed sequence number
+                                _lastSequenceNumber = seqNumber;
+                                Log.Debug($"Merged segment: sequence {seqNumber}, {segmentData.Length} bytes");
+                            }
+                            finally
+                            {
+                                _fileLock.Release();
                             }
                         }
                         else if (seqNumber > _lastSequenceNumber + 1)

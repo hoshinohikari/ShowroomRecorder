@@ -68,6 +68,7 @@ public class Listener
     private async Task Listen()
     {
         while (_isStarting)
+        {
             try
             {
                 Log.Debug($"{_name} test living");
@@ -95,7 +96,19 @@ public class Listener
             catch (Exception ex)
             {
                 Log.Error($"{_name} Listen error: {ex}");
+
+                // 在发生异常时等待一段时间后再重新访问
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    Log.Debug("Retry Task.Delay 被取消");
+                    break;
+                }
             }
+        }
 
         Log.Warning($"{_name} stop");
     }

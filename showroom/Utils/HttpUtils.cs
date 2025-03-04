@@ -48,6 +48,10 @@ public class HttpUtils
 
     public HttpUtils(string ip)
     {
+        // 设置系统环境变量以优先使用 IPv4
+        Environment.SetEnvironmentVariable("DOTNET_SYSTEM_NET_HTTP_SOCKETSHTTPHANDLER_HTTP2UNENCRYPTEDSUPPORT", "false");
+        Environment.SetEnvironmentVariable("DOTNET_SYSTEM_NET_DISABLEIPV6", "true");
+        
         var options = new RestClientOptions(ip)
         {
             ThrowOnAnyError = true,
@@ -55,6 +59,7 @@ public class HttpUtils
                 DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
             //AutomaticDecompression = DecompressionMethods.GZip
         };
+
         _client = new RestClient(options);
     }
 
