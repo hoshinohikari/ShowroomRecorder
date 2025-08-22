@@ -13,6 +13,8 @@ public class Listener
     private long _id;
     private bool _isStarting;
     private Recorder? _recorder;
+    private DateTime _lastApiCheck = DateTime.UtcNow;
+    private TimeSpan _apiCheckInterval = TimeSpan.Zero;
 
     public Listener(string name)
     {
@@ -53,6 +55,12 @@ public class Listener
         return status == 2;
     }
 
+    // 通过全局 Online 单例的 _roomIds 判断是否在线（异步）
+    private async Task<bool> IsLiving2()
+    {
+        return await Online.Instance.ContainsRoomAsync(_id);
+    }
+
     private async Task Start()
     {
         await GetId();
@@ -60,6 +68,9 @@ public class Listener
         if (_id == 0) return;
 
         Log.Debug($"get {_name} user id is {_id}");
+
+        // 初始化随机接口检查间隔（20~40 倍配置间隔）
+        _apiCheckInterval = GetRandomApiInterval();
 
         _isStarting = true;
         await Listen();
@@ -71,9 +82,15 @@ public class Listener
         {
             try
             {
-                Log.Debug($"{_name} test living");
+                Log.Debug($"{_name} test living (cache first)");
 
-                if (await IsLiving())
+                var living = await IsLiving2();
+
+                // 到达随机接口检查时间时，进行一次接口校验，避免同时触发
+                if (!living && ShouldApiCheck())
+                    living = await IsLiving();
+
+                if (living)
                 {
                     Log.Information($"{_name} begin living");
                     _recorder = new Recorder(_name, _id);
@@ -111,6 +128,35 @@ public class Listener
         }
 
         Log.Warning($"{_name} stop");
+    }
+
+    private bool ShouldApiCheck()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastApiCheck >= _apiCheckInterval)
+        {
+            _lastApiCheck = now;
+            _apiCheckInterval = GetRandomApiInterval();
+            Log.Debug($"{_name} trigger api check, next after {_apiCheckInterval.TotalSeconds:F0}s");
+            return true;
+        }
+
+        return false;
+    }
+
+    private static TimeSpan GetRandomApiInterval()
+    {
+        try
+        {
+            var baseSec = Math.Max(1, ConfigUtils.Config.Interval);
+            var multiplier = Random.Shared.Next(20, 41); // 20~40（含40）
+            return TimeSpan.FromSeconds(baseSec * multiplier);
+        }
+        catch
+        {
+            // 兜底：默认 30 倍 1 秒
+            return TimeSpan.FromSeconds(30);
+        }
     }
 
     public async Task Stop()

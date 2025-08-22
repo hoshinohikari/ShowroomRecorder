@@ -29,6 +29,8 @@ Log.Warning("hello");
 Log.Error("hello");
 Log.Fatal("hello");*/
 
+// 初始化在线检测（单例会在首次访问时启动）
+var online = Online.Instance;
 // 初始化监听器列表
 var listeners = ConfigUtils.Config.Users.Select(n => new Listener(n)).ToList();
 
@@ -56,6 +58,7 @@ async Task Cleanup()
     {
         List<Task> tasks = [];
         tasks.AddRange(listeners.Select(l => l.Stop()));
+        tasks.Add(online.Stop());
 
         await Task.WhenAll(tasks);
 
