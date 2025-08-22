@@ -36,7 +36,7 @@ public class Online
             {
                 Log.Debug("test all online users");
 
-                var res = await ShowroomHttp.Get("api/live/onlines", []);
+                var res = await ShowroomHttp.Get("api/live/onlives", []);
 
                 if (res.Item1 != HttpStatusCode.OK)
                 {
