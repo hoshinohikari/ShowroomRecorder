@@ -9,6 +9,7 @@ public class Configs
     public bool DebugLog { get; set; } = false;
     public bool FileLog { get; set; } = false;
     public double Interval { get; set; } = 20.0;
+    public string Proxy { get; set; } = "";
     public string Downloader { get; set; } = "none";
     public string[] Users { get; set; } = [];
     public string SrId { get; set; } = "";

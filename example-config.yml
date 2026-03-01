@@ -1,6 +1,7 @@
 DebugLog: false
 FileLog: false
 Interval: 20
+Proxy: "" # 支持 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
 Downloader: none
 Users: 
 - user1
