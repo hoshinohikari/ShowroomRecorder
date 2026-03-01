@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Serilog;
 
 namespace showroom.Download;
@@ -9,8 +10,8 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
     private const int SIGINT = 2;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private Task _downloadTask = null!;
-    private Timer _outputTimer = null!;
-    private Process _process = null!;
+    private Timer? _outputTimer;
+    private Process? _process;
 
     public override async Task DownloadAsync()
     {
@@ -35,25 +36,19 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             outputFilePath = Path.Combine(outputDirectory, $"{Name}_{timestamp}.ts");
 
             // 使用Minyami下载m3u8流并保存到本地
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "minyami",
-                Arguments = $"-d {Url} -o {outputFilePath} --temp-dir {outputDirectory} --timeout 5 --retries 5 --live",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            var startInfo = CreateStartInfo(Url, outputFilePath, outputDirectory);
 
             _process = new Process { StartInfo = startInfo };
             _process.OutputDataReceived += (_, args) =>
             {
-                Log.Verbose(args.Data!);
+                if (!string.IsNullOrWhiteSpace(args.Data))
+                    Log.Verbose(args.Data);
                 ResetOutputTimer();
             };
             _process.ErrorDataReceived += (_, args) =>
             {
-                Log.Warning(args.Data!);
+                if (!string.IsNullOrWhiteSpace(args.Data))
+                    Log.Warning(args.Data);
                 ResetOutputTimer();
             };
 
@@ -88,34 +83,123 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         {
             Log.Error($"{Name} 下载失败: {ex}");
         }
+        finally
+        {
+            _outputTimer?.Dispose();
+            _process?.Dispose();
+        }
+    }
+
+    internal static ProcessStartInfo CreateStartInfo(string url, string outputFilePath, string outputDirectory)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "minyami",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        startInfo.ArgumentList.Add("-d");
+        startInfo.ArgumentList.Add(url);
+        startInfo.ArgumentList.Add("-o");
+        startInfo.ArgumentList.Add(outputFilePath);
+        startInfo.ArgumentList.Add("--temp-dir");
+        startInfo.ArgumentList.Add(outputDirectory);
+        startInfo.ArgumentList.Add("--timeout");
+        startInfo.ArgumentList.Add("5");
+        startInfo.ArgumentList.Add("--retries");
+        startInfo.ArgumentList.Add("5");
+        startInfo.ArgumentList.Add("--live");
+
+        return startInfo;
     }
 
     private void ResetOutputTimer()
     {
-        _outputTimer.Change(TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
+        _outputTimer?.Change(TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
     }
 
     private void OutputTimerCallback(object? state)
     {
-        if (!_process.HasExited)
+        if (_process is { HasExited: false })
         {
             Log.Warning("Minyami 在10秒内没有任何输出，发送Ctrl+C信号终止进程。");
-            SendCtrlC(_process);
+            if (!SendCtrlC(_process))
+            {
+                Log.Warning("发送Ctrl+C失败，尝试强制终止进程。");
+                try
+                {
+                    _process.Kill();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "强制终止 Minyami 进程失败");
+                }
+            }
         }
     }
 
-    private void SendCtrlC(Process process)
+    private bool SendCtrlC(Process process)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             // Windows 平台发送 Ctrl+C 信号
-            GenerateConsoleCtrlEvent(ConsoleCtrlEvent.CTRL_C, (uint)process.SessionId);
+            return SendCtrlCWindows(process.Id);
         else
             // Unix 平台发送 SIGINT 信号
-            kill(process.Id, SIGINT);
+            return kill(process.Id, SIGINT) == 0;
+    }
+
+    private static bool SendCtrlCWindows(int pid)
+    {
+        try
+        {
+            if (!AttachConsole((uint)pid))
+                return false;
+
+            // Disable Ctrl+C handling for current process while sending
+            SetConsoleCtrlHandler(null, true);
+
+            // Send Ctrl+C to all processes attached to the console
+            var result = GenerateConsoleCtrlEvent(ConsoleCtrlEvent.CTRL_C, 0);
+
+            // Allow some time for the signal to be delivered
+            Thread.Sleep(200);
+
+            FreeConsole();
+            SetConsoleCtrlHandler(null, false);
+
+            return result;
+        }
+        catch
+        {
+            try
+            {
+                FreeConsole();
+            }
+            catch
+            {
+                // ignore
+            }
+
+            return false;
+        }
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GenerateConsoleCtrlEvent(ConsoleCtrlEvent sigevent, uint dwProcessGroupId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate? handlerRoutine, bool add);
+
+    private delegate bool ConsoleCtrlDelegate(uint ctrlType);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int pid, int sig);
@@ -125,7 +209,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         if (_cancellationTokenSource.IsCancellationRequested) return;
         await _cancellationTokenSource.CancelAsync();
 
-        if (_process.HasExited) return;
+        if (_process == null || _process.HasExited) return;
         var delayTask = Task.Delay(TimeSpan.FromSeconds(60));
         var processExitTask = Task.Run(() => _process.WaitForExit());
 

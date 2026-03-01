@@ -8,7 +8,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
 {
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private Task _downloadTask = null!;
-    private Process _process = null!;
+    private Process? _process;
 
     public override async Task DownloadAsync()
     {
@@ -16,11 +16,11 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         try
         {
             // 检查系统环境变量中是否存在Minyami
-            var minyamiExists = Environment.GetEnvironmentVariable("PATH")!
+            var streamlinkExists = Environment.GetEnvironmentVariable("PATH")!
                 .Split(Path.PathSeparator)
                 .Any(p => File.Exists(Path.Combine(p, "streamlink")) || File.Exists(Path.Combine(p, "streamlink.exe")));
 
-            if (!minyamiExists)
+            if (!streamlinkExists)
             {
                 Log.Error("streamlink 不存在，请安装streamlink后再试。");
                 return;
@@ -31,29 +31,29 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
             var outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
             if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
             outputFilePath = Path.Combine(outputDirectory, $"{Name}_{timestamp}.ts");
-            var args =
-                $"-4 -o {outputFilePath} --retry-streams 2 --stream-segment-threads 5 --stream-segment-timeout 1 --retry-open 6 --stream-timeout 5";
+
+            string? logFilePath = null;
             if (ConfigUtils.Config.FileLog)
             {
                 var logDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
                 if (!Directory.Exists(logDirectory)) Directory.CreateDirectory(logDirectory);
-                args += $" --loglevel all --logfile {Path.Combine(logDirectory, $"{Name}_{timestamp}.log")}";
+                logFilePath = Path.Combine(logDirectory, $"{Name}_{timestamp}.log");
             }
 
             // 使用Minyami下载m3u8流并保存到本地
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "streamlink",
-                Arguments = $"{args} {Url} best",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            var startInfo = CreateStartInfo(Url, outputFilePath, ConfigUtils.Config.FileLog, logFilePath);
 
             _process = new Process { StartInfo = startInfo };
-            _process.OutputDataReceived += (_, dataReceivedEventArgs) => { Log.Verbose(dataReceivedEventArgs.Data!); };
-            _process.ErrorDataReceived += (_, dataReceivedEventArgs) => { Log.Warning(dataReceivedEventArgs.Data!); };
+            _process.OutputDataReceived += (_, dataReceivedEventArgs) =>
+            {
+                if (!string.IsNullOrWhiteSpace(dataReceivedEventArgs.Data))
+                    Log.Verbose(dataReceivedEventArgs.Data);
+            };
+            _process.ErrorDataReceived += (_, dataReceivedEventArgs) =>
+            {
+                if (!string.IsNullOrWhiteSpace(dataReceivedEventArgs.Data))
+                    Log.Warning(dataReceivedEventArgs.Data);
+            };
 
             _process.Start();
             _process.BeginOutputReadLine();
@@ -83,6 +83,52 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         {
             Log.Error($"{Name} 下载失败: {ex}");
         }
+        finally
+        {
+            _process?.Dispose();
+        }
+    }
+
+    internal static ProcessStartInfo CreateStartInfo(string url, string outputFilePath, bool fileLog, string? logFilePath)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "streamlink",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        startInfo.ArgumentList.Add("-4");
+        startInfo.ArgumentList.Add("-o");
+        startInfo.ArgumentList.Add(outputFilePath);
+        startInfo.ArgumentList.Add("--retry-streams");
+        startInfo.ArgumentList.Add("2");
+        startInfo.ArgumentList.Add("--stream-segment-threads");
+        startInfo.ArgumentList.Add("5");
+        startInfo.ArgumentList.Add("--stream-segment-timeout");
+        startInfo.ArgumentList.Add("1");
+        startInfo.ArgumentList.Add("--retry-open");
+        startInfo.ArgumentList.Add("6");
+        startInfo.ArgumentList.Add("--stream-timeout");
+        startInfo.ArgumentList.Add("5");
+
+        if (fileLog)
+        {
+            if (string.IsNullOrWhiteSpace(logFilePath))
+                throw new ArgumentException("logFilePath is required when fileLog is enabled", nameof(logFilePath));
+
+            startInfo.ArgumentList.Add("--loglevel");
+            startInfo.ArgumentList.Add("all");
+            startInfo.ArgumentList.Add("--logfile");
+            startInfo.ArgumentList.Add(logFilePath);
+        }
+
+        startInfo.ArgumentList.Add(url);
+        startInfo.ArgumentList.Add("best");
+
+        return startInfo;
     }
 
     public override async Task Stop()
@@ -90,7 +136,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         if (_cancellationTokenSource.IsCancellationRequested) return;
         await _cancellationTokenSource.CancelAsync();
 
-        if (_process.HasExited) return;
+        if (_process == null || _process.HasExited) return;
         var delayTask = Task.Delay(TimeSpan.FromSeconds(60));
         var processExitTask = Task.Run(() => _process.WaitForExit());
 
