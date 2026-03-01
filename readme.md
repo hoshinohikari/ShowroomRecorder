@@ -14,10 +14,11 @@ An unattended Showroom recording tool based on C#
 Supported download backends: FFmpeg, minyami, minyami-iori, streamlink
 
 ## How to use
-Rename [`example-config.yml`](/example-config.yml) to `config.yml`, and add the users you want to monitor to the `Users` section  
+Rename [`example-config.yml`](/example-config.yml) to `configs.yml`, and add the users you want to monitor to the `Users` section  
 For `Downloader`, you can choose your preferred download backend
+This version reads configuration from `configs.yml`.
 
-config.yml
+configs.yml
 ```
 DebugLog: false # Whether to enable debug log output to stdout
 FileLog: false # Whether to enable file log recording, file logs are always at debug level

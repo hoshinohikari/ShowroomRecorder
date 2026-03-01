@@ -13,10 +13,11 @@
 支持下载后端：FFmpeg、minyami、minyami-iori、streamlink
 
 ## How to use
-将[`example-config.yml`](/example-config.yml)重命名为`config.yml`，将你想监控的用户添加到`Users`里面  
+将[`example-config.yml`](/example-config.yml)重命名为`configs.yml`，将你想监控的用户添加到`Users`里面  
 `Downloader`可以选择你喜欢的下载后端
+当前版本读取的配置文件名为`configs.yml`。
 
-config.yml
+configs.yml
 ```
 DebugLog: false # 是否打开stdout的debug日志内容输出
 FileLog: false # 是否打开文件log记录，文件log始终为debug级
