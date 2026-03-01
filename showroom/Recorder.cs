@@ -23,6 +23,13 @@ public class Recorder(string name, long id)
             ("abr_available", "1")
         ]);
 
+        if (res.Item1 != System.Net.HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
+        {
+            Log.Warning($"GetUrls failed: {res.Item1}");
+            _recordUrl = string.Empty;
+            return;
+        }
+
         Log.Debug($"GetUrls \"{res.Item2}\"");
 
         if (res.Item2 == "{}")
@@ -51,7 +58,7 @@ public class Recorder(string name, long id)
 
         if (_recordUrl == string.Empty)
         {
-            await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval));
+            await Task.Delay(ConfigUtils.Interval);
             return;
         }
 
@@ -79,6 +86,7 @@ public class Recorder(string name, long id)
 
     public async Task Stop()
     {
-        await _download?.Stop()!;
+        if (_download == null) return;
+        await _download.Stop();
     }
 }

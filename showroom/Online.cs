@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 using Serilog;
@@ -7,14 +8,11 @@ namespace showroom;
 
 public class Online
 {
-    private readonly CancellationTokenSource _cancellationTokenSource = new();
-    private readonly Task _task;
-    private bool _isStarting;
-    private readonly HashSet<long> _roomIds = new();
-
     // 全局单例
     private static readonly Lazy<Online> _instance = new(() => new Online());
-    public static Online Instance => _instance.Value;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly ConcurrentDictionary<long, byte> _roomIds = new(); // 使用 ConcurrentDictionary
+    private readonly Task _task;
 
     private Online()
     {
@@ -22,34 +20,26 @@ public class Online
         _task = Start();
     }
 
+    public static Online Instance => _instance.Value;
+
     private async Task Start()
     {
-        _isStarting = true;
         await Listen();
     }
 
     private async Task Listen()
     {
-        while (_isStarting)
-        {
+        while (!_cancellationTokenSource.IsCancellationRequested)
             try
             {
-                Log.Debug("test all online users");
-
                 var res = await ShowroomHttp.Get("api/live/onlives", []);
 
-                if (res.Item1 != HttpStatusCode.OK)
+                if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
                 {
-                    Log.Warning("get onlines failed: {Status} {Body}", res.Item1, res.Item2);
-                    try
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
-                    }
-                    catch (TaskCanceledException)
-                    {
-                        Log.Debug("Task.Delay 被取消");
+                    Log.Warning("get onlines failed: {Status}", res.Item1);
+                    if (await DelayWithCancel(ConfigUtils.Interval))
                         break;
-                    }
+
                     continue;
                 }
 
@@ -60,8 +50,8 @@ public class Online
 
                     if (root.TryGetProperty("onlives", out var onlives) && onlives.ValueKind == JsonValueKind.Array)
                     {
-                        // 用临时集合构建，然后一次性替换，避免读写竞争
-                        var tmp = new HashSet<long>();
+                        // 收集新的房间ID
+                        var newRoomIds = new HashSet<long>();
 
                         foreach (var genre in onlives.EnumerateArray())
                         {
@@ -69,29 +59,27 @@ public class Online
                                 continue;
 
                             foreach (var live in lives.EnumerateArray())
-                            {
-                                if (live.TryGetProperty("room_id", out var roomIdProp) && roomIdProp.ValueKind == JsonValueKind.Number)
-                                {
+                                if (live.TryGetProperty("room_id", out var roomIdProp) &&
+                                    roomIdProp.ValueKind == JsonValueKind.Number)
                                     try
                                     {
                                         var id = roomIdProp.GetInt64();
-                                        tmp.Add(id);
+                                        newRoomIds.Add(id);
                                     }
                                     catch
                                     {
                                         // 忽略非 long 的异常
                                     }
-                                }
-                            }
                         }
 
-                        // 原子地更新内部集合
-                        lock (_roomIds)
-                        {
-                            _roomIds.Clear();
-                            foreach (var id in tmp)
-                                _roomIds.Add(id);
-                        }
+                        // 移除不在新列表中的房间
+                        foreach (var existingId in _roomIds.Keys)
+                            if (!newRoomIds.Contains(existingId))
+                                _roomIds.TryRemove(existingId, out _);
+
+                        // 添加新房间
+                        foreach (var id in newRoomIds)
+                            _roomIds.TryAdd(id, 0);
 
                         Log.Debug("parsed {Count} online room_ids", _roomIds.Count);
                     }
@@ -105,71 +93,121 @@ public class Online
                     Log.Error(ex, "parse onlines json error");
                 }
 
+                if (ConfigUtils.Config.SrId != "")
+                {
+                    // 如果登记了SrId，则继续获取关注列表以保持活跃
+                    res = await ShowroomHttp.Get("api/follow/rooms", []);
+
+                    if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
+                    {
+                        Log.Warning("get follow failed: {Status}", res.Item1);
+                        if (await DelayWithCancel(ConfigUtils.Interval))
+                            break;
+
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var document = JsonDocument.Parse(res.Item2);
+                        var root = document.RootElement;
+
+                        if (root.TryGetProperty("rooms", out var rooms) && rooms.ValueKind == JsonValueKind.Array)
+                        {
+                            var followCount = 0;
+                            foreach (var genre in rooms.EnumerateArray())
+                            {
+                                if (!genre.TryGetProperty("room_id", out var roomIdProp) ||
+                                    roomIdProp.ValueKind != JsonValueKind.String) continue;
+                                try
+                                {
+                                    var isOnline = false;
+                                    var id = long.Parse(roomIdProp.GetString()!);
+                                    followCount++;
+
+                                    if (genre.TryGetProperty("is_online", out var isOnlineProp) &&
+                                        isOnlineProp.ValueKind == JsonValueKind.Number)
+                                        isOnline = isOnlineProp.GetInt64() != 0;
+
+                                    if (isOnline)
+                                        _roomIds.TryAdd(id, 0);
+                                    else
+                                        _roomIds.TryRemove(id, out _);
+                                }
+                                catch
+                                {
+                                    // 忽略非 long 的异常
+                                }
+                            }
+
+                            Log.Debug("fetched follow rooms: {FollowCount}, online room_ids: {OnlineCount}",
+                                followCount, _roomIds.Count);
+                        }
+                        else
+                        {
+                            Log.Warning("rooms field missing or not array");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "parse follow json error");
+                    }
+                }
+
                 // 正常情况下，等待一段时间再轮询
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
-                }
-                catch (TaskCanceledException)
-                {
-                    Log.Debug("Task.Delay 被取消");
+                if (await DelayWithCancel(ConfigUtils.Interval))
                     break;
-                }
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "online Listen error");
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
-                }
-                catch (TaskCanceledException)
-                {
-                    Log.Debug("Retry Task.Delay 被取消");
+                if (await DelayWithCancel(ConfigUtils.Interval))
                     break;
-                }
             }
-        }
     }
 
-    // 提供线程安全的房间在线查询（异步包装，避免调用方阻塞）
+    // 提供线程安全的房间在线查询
     public Task<bool> ContainsRoomAsync(long roomId)
     {
-        lock (_roomIds)
-        {
-            return Task.FromResult(_roomIds.Contains(roomId));
-        }
+        return Task.FromResult(_roomIds.ContainsKey(roomId));
     }
 
-    // 可选：获取只读快照的异步方法
+    // 获取只读快照
     public Task<IReadOnlyCollection<long>> GetRoomIdsSnapshotAsync()
     {
-        lock (_roomIds)
-        {
-            IReadOnlyCollection<long> snapshot = _roomIds.ToArray();
-            return Task.FromResult(snapshot);
-        }
+        IReadOnlyCollection<long> snapshot = _roomIds.Keys.ToArray();
+        return Task.FromResult(snapshot);
     }
 
     public IReadOnlyCollection<long> GetRoomIdsSnapshot()
     {
-        lock (_roomIds)
-        {
-            return _roomIds.ToArray();
-        }
+        return _roomIds.Keys.ToArray();
     }
 
     public async Task Stop()
     {
         try
         {
-            _isStarting = false;
             await _cancellationTokenSource.CancelAsync();
             await _task;
         }
         catch (Exception ex)
         {
             Log.Error(ex, "online stop error");
+        }
+    }
+
+    private async Task<bool> DelayWithCancel(TimeSpan delay)
+    {
+        try
+        {
+            await Task.Delay(delay, _cancellationTokenSource.Token);
+            return false;
+        }
+        catch (TaskCanceledException)
+        {
+            Log.Verbose("Task.Delay 被取消");
+            return true;
         }
     }
 }

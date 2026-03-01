@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Text.Json;
 using Serilog;
 using showroom.Utils;
@@ -10,47 +10,65 @@ public class Listener
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly string _name;
     private readonly Task _task;
-    private long _id;
-    private bool _isStarting;
-    private Recorder? _recorder;
-    private DateTime _lastApiCheck = DateTime.UtcNow;
     private TimeSpan _apiCheckInterval = TimeSpan.Zero;
+    private long _id;
+    private DateTime _lastApiCheck = DateTime.UtcNow;
+    private Recorder? _recorder;
 
     public Listener(string name)
     {
         _name = name;
-        Log.Information($"start listen to {name}");
+        Log.Information("start listen to {Name}", name);
         _task = Start();
     }
 
-    private async Task GetId()
+    private async Task<(bool Success, string Error)> TryGetId()
     {
         var res = await ShowroomHttp.Get("api/room/status", [("room_url_key", $"{_name}")]);
 
         if (res.Item1 == HttpStatusCode.NotFound)
+            return (false, "user not found");
+
+        if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
+            return (false, $"status: {res.Item1}");
+
+        try
         {
-            Log.Warning($"user {_name} not found");
-            return;
+            using var document = JsonDocument.Parse(res.Item2);
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("room_id", out var roomIdProp) || roomIdProp.ValueKind != JsonValueKind.Number)
+                return (false, "room_id missing in response");
+
+            _id = roomIdProp.GetInt64();
+            return _id == 0 ? (false, "room_id is 0") : (true, string.Empty);
         }
-
-        Log.Debug($"GetId \"{res.Item2}\"");
-
-        using var document = JsonDocument.Parse(res.Item2);
-        var root = document.RootElement;
-
-        _id = root.GetProperty("room_id").GetInt64();
+        catch (Exception ex)
+        {
+            return (false, $"parse error: {ex.Message}");
+        }
     }
 
     private async Task<bool> IsLiving()
     {
         var res = await ShowroomHttp.Get("api/live/live_info", [("room_id", $"{_id}")]);
 
-        Log.Debug($"IsLiving \"{res.Item2}\"");
+        if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
+        {
+            Log.Warning("IsLiving failed: {Status}", res.Item1);
+            return false;
+        }
 
         using var document = JsonDocument.Parse(res.Item2);
         var root = document.RootElement;
 
-        var status = root.GetProperty("live_status").GetInt64();
+        if (!root.TryGetProperty("live_status", out var statusProp) || statusProp.ValueKind != JsonValueKind.Number)
+        {
+            Log.Warning("{Name} live_info missing live_status", _name);
+            return false;
+        }
+
+        var status = statusProp.GetInt64();
 
         return status == 2;
     }
@@ -63,27 +81,27 @@ public class Listener
 
     private async Task Start()
     {
-        await GetId();
+        var (success, error) = await TryGetId();
 
-        if (_id == 0) return;
+        if (!success)
+        {
+            Log.Error("{Name} listener initialization failed, listen not started: {Error}", _name, error);
+            return;
+        }
 
-        Log.Debug($"get {_name} user id is {_id}");
+        Log.Debug("get {Name} user id is {Id}", _name, _id);
 
         // 初始化随机接口检查间隔（20~40 倍配置间隔）
         _apiCheckInterval = GetRandomApiInterval();
 
-        _isStarting = true;
         await Listen();
     }
 
     private async Task Listen()
     {
-        while (_isStarting)
-        {
+        while (!_cancellationTokenSource.IsCancellationRequested)
             try
             {
-                Log.Debug($"{_name} test living (cache first)");
-
                 var living = await IsLiving2();
 
                 // 到达随机接口检查时间时，进行一次接口校验，避免同时触发
@@ -92,42 +110,32 @@ public class Listener
 
                 if (living)
                 {
-                    Log.Information($"{_name} begin living");
+                    if (_cancellationTokenSource.IsCancellationRequested)
+                        break;
+
+                    Log.Information("{Name} begin living", _name);
                     _recorder = new Recorder(_name, _id);
                     await _recorder.Start();
+
+                    if (_cancellationTokenSource.IsCancellationRequested)
+                        break;
+
                     continue;
                 }
 
-                Log.Debug($"{_name} not living");
-
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
-                }
-                catch (TaskCanceledException)
-                {
-                    Log.Debug("Task.Delay 被取消");
+                if (await DelayWithCancel(ConfigUtils.Interval))
                     break;
-                }
             }
             catch (Exception ex)
             {
-                Log.Error($"{_name} Listen error: {ex}");
+                Log.Error(ex, "{Name} Listen error", _name);
 
                 // 在发生异常时等待一段时间后再重新访问
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(ConfigUtils.Config.Interval), _cancellationTokenSource.Token);
-                }
-                catch (TaskCanceledException)
-                {
-                    Log.Debug("Retry Task.Delay 被取消");
+                if (await DelayWithCancel(ConfigUtils.Interval))
                     break;
-                }
             }
-        }
 
-        Log.Warning($"{_name} stop");
+        Log.Warning("{Name} stop", _name);
     }
 
     private bool ShouldApiCheck()
@@ -137,7 +145,8 @@ public class Listener
         {
             _lastApiCheck = now;
             _apiCheckInterval = GetRandomApiInterval();
-            Log.Debug($"{_name} trigger api check, next after {_apiCheckInterval.TotalSeconds:F0}s");
+            Log.Verbose("{Name} trigger api check, next after {Seconds:F0}s", _name,
+                _apiCheckInterval.TotalSeconds);
             return true;
         }
 
@@ -163,15 +172,31 @@ public class Listener
     {
         try
         {
-            _isStarting = false;
+            if (!_cancellationTokenSource.IsCancellationRequested)
+                await _cancellationTokenSource.CancelAsync();
+
             if (_recorder != null)
-                await _recorder?.Stop()!;
-            await _cancellationTokenSource.CancelAsync();
+                await _recorder.Stop();
+
             await _task;
         }
         catch (Exception ex)
         {
-            Log.Error($"{_name} Listen stop error: {ex}");
+            Log.Error(ex, "{Name} Listen stop error", _name);
+        }
+    }
+
+    private async Task<bool> DelayWithCancel(TimeSpan delay)
+    {
+        try
+        {
+            await Task.Delay(delay, _cancellationTokenSource.Token);
+            return false;
+        }
+        catch (TaskCanceledException)
+        {
+            Log.Verbose("Task.Delay 被取消");
+            return true;
         }
     }
 }

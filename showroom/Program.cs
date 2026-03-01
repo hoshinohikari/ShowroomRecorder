@@ -4,6 +4,12 @@ using Serilog.Sinks.SystemConsole.Themes;
 using showroom;
 using showroom.Utils;
 
+// Bootstrap logger to capture early initialization logs
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Debug()
+    .WriteTo.Console(theme: AnsiConsoleTheme.Sixteen, restrictedToMinimumLevel: LogEventLevel.Information)
+    .CreateLogger();
+
 var loggerConfig = new LoggerConfiguration()
     .MinimumLevel.Debug();
 
@@ -47,10 +53,9 @@ Console.CancelKeyPress += async (_, e) =>
     Environment.Exit(0);
 };
 
-// 无限循环，等待用户按下 Ctrl+C
-while (true)
-    // 这里可以插入你的代码
-    await Task.Delay(TimeSpan.FromHours(1));
+// 无限等待，直到触发 Ctrl+C
+await Task.Delay(Timeout.InfiniteTimeSpan);
+return;
 
 async Task Cleanup()
 {

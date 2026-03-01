@@ -11,6 +11,7 @@ public class Configs
     public double Interval { get; set; } = 20.0;
     public string Downloader { get; set; } = "none";
     public string[] Users { get; set; } = [];
+    public string SrId { get; set; } = "";
 }
 
 public static class ConfigUtils
@@ -49,4 +50,6 @@ public static class ConfigUtils
     }
 
     public static Configs Config { get; set; } = new();
+
+    public static TimeSpan Interval => TimeSpan.FromSeconds(Config.Interval);
 }
