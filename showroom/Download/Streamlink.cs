@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using Serilog;
 using showroom.Utils;
 
@@ -15,6 +15,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         string outputFilePath = null!;
         try
         {
+            Log.Debug("{Name} streamlink download start", Name);
             // 检查系统环境变量中是否存在Minyami
             var streamlinkExists = Environment.GetEnvironmentVariable("PATH")!
                 .Split(Path.PathSeparator)
@@ -31,6 +32,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
             var outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
             if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
             outputFilePath = Path.Combine(outputDirectory, $"{Name}_{timestamp}.ts");
+            RecordingRegistry.MarkRecording(outputFilePath);
 
             string? logFilePath = null;
             if (ConfigUtils.Config.FileLog)
@@ -42,6 +44,8 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
 
             // 使用Minyami下载m3u8流并保存到本地
             var startInfo = CreateStartInfo(Url, outputFilePath, ConfigUtils.Config.FileLog, logFilePath);
+            Log.Debug("{Name} streamlink start: url={Url}, output={Output}, fileLog={FileLog}",
+                Name, Url, outputFilePath, ConfigUtils.Config.FileLog);
 
             _process = new Process { StartInfo = startInfo };
             _process.OutputDataReceived += (_, dataReceivedEventArgs) =>
@@ -59,8 +63,9 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
             _process.BeginOutputReadLine();
             _process.BeginErrorReadLine();
 
-            _downloadTask = Task.Run(() => _process.WaitForExit(), _cancellationTokenSource.Token);
+            _downloadTask = _process.WaitForExitAsync(_cancellationTokenSource.Token);
             await _downloadTask;
+            Log.Debug("{Name} streamlink exited: code={ExitCode}", Name, _process.ExitCode);
 
             switch (_process.ExitCode)
             {
@@ -85,11 +90,13 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         }
         finally
         {
+            RecordingRegistry.MarkCompleted(outputFilePath);
             _process?.Dispose();
         }
     }
 
-    internal static ProcessStartInfo CreateStartInfo(string url, string outputFilePath, bool fileLog, string? logFilePath)
+    internal static ProcessStartInfo CreateStartInfo(string url, string outputFilePath, bool fileLog,
+        string? logFilePath)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -133,6 +140,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
 
     public override async Task Stop()
     {
+        Log.Debug("{Name} streamlink stop requested", Name);
         if (_cancellationTokenSource.IsCancellationRequested) return;
         await _cancellationTokenSource.CancelAsync();
 
@@ -148,6 +156,7 @@ public class StreamlinkUtils(string name, string url) : DownloadUtils(name, url)
         {
             Log.Warning($"{Name} 进程在60秒内未结束，强制终止进程。");
             _process.Kill();
+            Log.Warning("{Name} streamlink process killed", Name);
         }
         else
         {

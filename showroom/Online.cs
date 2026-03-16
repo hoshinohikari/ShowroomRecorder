@@ -1,8 +1,8 @@
 using System.Collections.Concurrent;
-using System.Net;
 using System.Text.Json;
 using Serilog;
 using showroom.Utils;
+using HttpStatusCode = System.Net.HttpStatusCode;
 
 namespace showroom;
 
@@ -29,9 +29,13 @@ public class Online
 
     private async Task Listen()
     {
+        Log.Debug("Online listener loop started");
+        var cycle = 0L;
         while (!_cancellationTokenSource.IsCancellationRequested)
             try
             {
+                cycle++;
+                Log.Verbose("Online polling cycle={Cycle}", cycle);
                 var res = await ShowroomHttp.Get("api/live/onlives", []);
 
                 if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
@@ -50,6 +54,7 @@ public class Online
 
                     if (root.TryGetProperty("onlives", out var onlives) && onlives.ValueKind == JsonValueKind.Array)
                     {
+                        Log.Verbose("onlives genres count={GenreCount}", onlives.GetArrayLength());
                         // 收集新的房间ID
                         var newRoomIds = new HashSet<long>();
 
@@ -73,15 +78,20 @@ public class Online
                         }
 
                         // 移除不在新列表中的房间
+                        var removed = 0;
                         foreach (var existingId in _roomIds.Keys)
                             if (!newRoomIds.Contains(existingId))
-                                _roomIds.TryRemove(existingId, out _);
+                                if (_roomIds.TryRemove(existingId, out _))
+                                    removed++;
 
                         // 添加新房间
+                        var added = 0;
                         foreach (var id in newRoomIds)
-                            _roomIds.TryAdd(id, 0);
+                            if (_roomIds.TryAdd(id, 0))
+                                added++;
 
-                        Log.Debug("parsed {Count} online room_ids", _roomIds.Count);
+                        Log.Debug("parsed online room_ids: total={Total}, added={Added}, removed={Removed}",
+                            _roomIds.Count, added, removed);
                     }
                     else
                     {
@@ -140,7 +150,7 @@ public class Online
                                 }
                             }
 
-                            Log.Debug("fetched follow rooms: {FollowCount}, online room_ids: {OnlineCount}",
+                            Log.Debug("fetched follow rooms: followCount={FollowCount}, onlineCount={OnlineCount}",
                                 followCount, _roomIds.Count);
                         }
                         else
@@ -164,12 +174,16 @@ public class Online
                 if (await DelayWithCancel(ConfigUtils.Interval))
                     break;
             }
+
+        Log.Debug("Online listener loop stopped");
     }
 
     // 提供线程安全的房间在线查询
     public Task<bool> ContainsRoomAsync(long roomId)
     {
-        return Task.FromResult(_roomIds.ContainsKey(roomId));
+        var contains = _roomIds.ContainsKey(roomId);
+        Log.Verbose("Online cache contains room={RoomId}, result={Contains}", roomId, contains);
+        return Task.FromResult(contains);
     }
 
     // 获取只读快照
@@ -188,8 +202,10 @@ public class Online
     {
         try
         {
+            Log.Debug("Online stop requested");
             await _cancellationTokenSource.CancelAsync();
             await _task;
+            Log.Debug("Online stopped");
         }
         catch (Exception ex)
         {

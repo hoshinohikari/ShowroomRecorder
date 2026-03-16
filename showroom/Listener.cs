@@ -1,7 +1,7 @@
-using System.Net;
 using System.Text.Json;
 using Serilog;
 using showroom.Utils;
+using HttpStatusCode = System.Net.HttpStatusCode;
 
 namespace showroom;
 
@@ -24,6 +24,7 @@ public class Listener
 
     private async Task<(bool Success, string Error)> TryGetId()
     {
+        Log.Verbose("{Name} resolving room id", _name);
         var res = await ShowroomHttp.Get("api/room/status", [("room_url_key", $"{_name}")]);
 
         if (res.Item1 == HttpStatusCode.NotFound)
@@ -41,6 +42,7 @@ public class Listener
                 return (false, "room_id missing in response");
 
             _id = roomIdProp.GetInt64();
+            Log.Verbose("{Name} resolved room id={RoomId}", _name, _id);
             return _id == 0 ? (false, "room_id is 0") : (true, string.Empty);
         }
         catch (Exception ex)
@@ -51,6 +53,7 @@ public class Listener
 
     private async Task<bool> IsLiving()
     {
+        Log.Verbose("{Name} querying live_info by API for room {RoomId}", _name, _id);
         var res = await ShowroomHttp.Get("api/live/live_info", [("room_id", $"{_id}")]);
 
         if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
@@ -70,13 +73,17 @@ public class Listener
 
         var status = statusProp.GetInt64();
 
-        return status == 2;
+        var living = status == 2;
+        Log.Verbose("{Name} live_info status={Status}, living={Living}", _name, status, living);
+        return living;
     }
 
     // 通过全局 Online 单例的 _roomIds 判断是否在线（异步）
     private async Task<bool> IsLiving2()
     {
-        return await Online.Instance.ContainsRoomAsync(_id);
+        var result = await Online.Instance.ContainsRoomAsync(_id);
+        Log.Verbose("{Name} cache living={Living}", _name, result);
+        return result;
     }
 
     private async Task Start()
@@ -93,6 +100,7 @@ public class Listener
 
         // 初始化随机接口检查间隔（20~40 倍配置间隔）
         _apiCheckInterval = GetRandomApiInterval();
+        Log.Debug("{Name} api check interval initialized: {Seconds:F0}s", _name, _apiCheckInterval.TotalSeconds);
 
         await Listen();
     }
@@ -103,10 +111,14 @@ public class Listener
             try
             {
                 var living = await IsLiving2();
+                Log.Verbose("{Name} living cache result={Living}", _name, living);
 
                 // 到达随机接口检查时间时，进行一次接口校验，避免同时触发
                 if (!living && ShouldApiCheck())
+                {
+                    Log.Debug("{Name} cache miss, trigger API living check", _name);
                     living = await IsLiving();
+                }
 
                 if (living)
                 {
@@ -115,6 +127,7 @@ public class Listener
 
                     Log.Information("{Name} begin living", _name);
                     _recorder = new Recorder(_name, _id);
+                    Log.Debug("{Name} recorder instance created", _name);
                     await _recorder.Start();
 
                     if (_cancellationTokenSource.IsCancellationRequested)
@@ -173,12 +186,20 @@ public class Listener
         try
         {
             if (!_cancellationTokenSource.IsCancellationRequested)
+            {
+                Log.Debug("{Name} listener stop requested", _name);
                 await _cancellationTokenSource.CancelAsync();
+            }
+            else
+            {
+                Log.Verbose("{Name} listener stop called repeatedly", _name);
+            }
 
             if (_recorder != null)
                 await _recorder.Stop();
 
             await _task;
+            Log.Debug("{Name} listener stopped", _name);
         }
         catch (Exception ex)
         {

@@ -1,11 +1,11 @@
 using System.Collections.Concurrent;
-using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Serilog;
 using showroom.Utils;
 using SimpleM3U8Parser;
 using SimpleM3U8Parser.Media;
+using HttpStatusCode = System.Net.HttpStatusCode;
 
 namespace showroom.Download;
 
@@ -42,7 +42,7 @@ public class ShowroomUtils : DownloadUtils
     private Task? _mergeTask; // New: merge thread
     private int _nonContinuousRetryCount;
     private volatile bool _stopDownloading;
-    private volatile bool _stopFetchingM3u8;
+    private volatile bool _stopFetchingM3U8;
     private long _waitingForSequence = -1;
 
     public ShowroomUtils(string name, string url) : base(name, url)
@@ -61,6 +61,7 @@ public class ShowroomUtils : DownloadUtils
     {
         var timestamp = DateTime.Now.ToString("yyyy_MM_dd_HH_mm_ss_fff");
         _combinedFilePath = Path.Combine(_outputDirectory, $"{Name}_{timestamp}.ts");
+        RecordingRegistry.MarkRecording(_combinedFilePath);
         Log.Information($"Creating new output file: {_combinedFilePath}");
     }
 
@@ -92,12 +93,13 @@ public class ShowroomUtils : DownloadUtils
         try
         {
             _isDownloading = true;
+            Log.Debug("{Name} showroom downloader start: playlist={PlaylistUrl}", Name, Url);
 
             // Initialize download task
             _downloadTask = Task.Run(ProcessDownloadQueueAsync);
 
             // Initialize m3u8 fetch task
-            _fetchTask = Task.Run(FetchM3u8ContentAsync);
+            _fetchTask = Task.Run(FetchM3U8ContentAsync);
 
             // Delayed initialization of merge task - wait for first block download
             _mergeTask = Task.Run(async () =>
@@ -125,11 +127,12 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
-            Log.Error($"Error initializing download process: {ex}");
+            Log.Error(ex, "{Name} initialize showroom download process failed", Name);
         }
         finally
         {
             _isDownloading = false;
+            Log.Debug("{Name} showroom downloader end", Name);
         }
     }
 
@@ -213,8 +216,10 @@ public class ShowroomUtils : DownloadUtils
                                 Log.Warning(
                                     $"After 3 retries, still non-continuous sequence: last {_lastSequenceNumber}, current {seqNumber}, gap {seqNumber - _lastSequenceNumber - 1}, creating new file");
                                 // 关闭当前文件流
+                                var completedFilePath = _combinedFilePath;
                                 await currentFileStream.FlushAsync(_cancellationTokenSource.Token);
                                 await currentFileStream.DisposeAsync();
+                                UploadCompletedFile(completedFilePath);
 
                                 // Create new file
                                 CreateNewOutputFile();
@@ -264,7 +269,7 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
-            Log.Error($"Error during merge process: {ex}");
+            Log.Error(ex, "{Name} error during merge process", Name);
         }
         finally
         {
@@ -275,15 +280,29 @@ public class ShowroomUtils : DownloadUtils
                     await currentFileStream.FlushAsync();
                     await currentFileStream.DisposeAsync();
                     Log.Debug($"File stream closed for: {_combinedFilePath}");
+                    UploadCompletedFile(_combinedFilePath);
                 }
                 catch (Exception ex)
                 {
-                    Log.Error($"Error closing file stream: {ex.Message}");
+                    Log.Error(ex, "{Name} error closing file stream", Name);
                 }
         }
     }
 
-    private async Task FetchM3u8ContentAsync()
+    private void UploadCompletedFile(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            Log.Warning("{Name} upload skipped: file path is empty", Name);
+            return;
+        }
+
+        RecordingRegistry.MarkCompleted(filePath);
+        Log.Debug("{Name} completed recording file, upload will be handled by background scanner: {FilePath}", Name,
+            filePath);
+    }
+
+    private async Task FetchM3U8ContentAsync()
     {
         try
         {
@@ -291,15 +310,15 @@ public class ShowroomUtils : DownloadUtils
             var defaultWaitTime = TimeSpan.FromSeconds(4); // Default wait time of 4 seconds
 
             // Continue fetching m3u8 content until cancelled or max retries reached
-            while (!_cancellationTokenSource.IsCancellationRequested && !_stopFetchingM3u8)
+            while (!_cancellationTokenSource.IsCancellationRequested && !_stopFetchingM3U8)
                 try
                 {
-                    var m3u8Content =
+                    var m3U8Content =
                         await ShowroomDownloadHttp.Get(Url, new List<(string, string)>(), 2000);
 
-                    if (m3u8Content.Item1 != HttpStatusCode.OK)
+                    if (m3U8Content.Item1 != HttpStatusCode.OK)
                     {
-                        Log.Error($"Unable to fetch m3u8 content, status code: {m3u8Content.Item1}");
+                        Log.Error($"Unable to fetch m3u8 content, status code: {m3U8Content.Item1}");
 
                         // Increment retry counter
                         retryCount++;
@@ -311,7 +330,7 @@ public class ShowroomUtils : DownloadUtils
                             Log.Information("Failed to fetch 5 consecutive times, stream may have ended");
 
                             // Set stop flags to begin shutdown process
-                            _stopFetchingM3u8 = true;
+                            _stopFetchingM3U8 = true;
 
                             // When stream ends, signal to stop downloading
                             // Note: This will let the download queue complete existing content before stopping
@@ -328,13 +347,13 @@ public class ShowroomUtils : DownloadUtils
                     // Successfully fetched m3u8 content, reset retry counter
                     retryCount = 0;
 
-                    Log.Verbose("Get m3u8 content length: {Length}", m3u8Content.Item2.Length);
-                    var m3u8 = M3u8Parser.Parse(m3u8Content.Item2);
+                    Log.Verbose("Get m3u8 content length: {Length}", m3U8Content.Item2.Length);
+                    var m3U8 = M3u8Parser.Parse(m3U8Content.Item2);
                     var newSegments = 0;
                     var totalMediaDuration = 0.0; // Total duration of all media segments in seconds
 
                     // Add new segments to queue
-                    foreach (var segment in m3u8.Medias)
+                    foreach (var segment in m3U8.Medias)
                     {
                         // Accumulate segment duration (assuming segment has Duration property in seconds)
                         // Note: If M3u8Media doesn't directly provide Duration, adjust based on actual implementation
@@ -349,7 +368,7 @@ public class ShowroomUtils : DownloadUtils
                         catch (ChannelClosedException)
                         {
                             Log.Verbose("Segment channel closed, stop adding new segments");
-                            _stopFetchingM3u8 = true;
+                            _stopFetchingM3U8 = true;
                             break;
                         }
 
@@ -384,7 +403,7 @@ public class ShowroomUtils : DownloadUtils
                 }
                 catch (Exception ex)
                 {
-                    Log.Error($"Error fetching m3u8 content: {ex}");
+                    Log.Error(ex, "{Name} error fetching m3u8 content", Name);
 
                     // Increment retry counter (exceptions also count as retries)
                     retryCount++;
@@ -396,7 +415,7 @@ public class ShowroomUtils : DownloadUtils
                         Log.Information("Failed to fetch 5 consecutive times, stream may have ended");
 
                         // Set stop flags to begin shutdown process
-                        _stopFetchingM3u8 = true;
+                        _stopFetchingM3U8 = true;
 
                         // When stream ends, signal to stop downloading
                         _stopDownloading = true;
@@ -414,7 +433,7 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
-            Log.Error($"Unhandled exception in m3u8 fetch task: {ex}");
+            Log.Error(ex, "{Name} unhandled exception in m3u8 fetch task", Name);
         }
         finally
         {
@@ -489,7 +508,7 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
-            Log.Error($"Error during download processing: {ex}");
+            Log.Error(ex, "{Name} error during download processing", Name);
         }
         finally
         {
@@ -578,7 +597,9 @@ public class ShowroomUtils : DownloadUtils
 
                 if (retryCount > maxRetries)
                 {
-                    Log.Error($"Error downloading segment after {maxRetries} attempts: {segment.Path}, error: {ex}");
+                    Log.Error(ex,
+                        "{Name} error downloading segment after retries: retries={MaxRetries}, segmentPath={SegmentPath}",
+                        Name, maxRetries, segment.Path);
                     break;
                 }
 
@@ -595,10 +616,13 @@ public class ShowroomUtils : DownloadUtils
         if (_isDownloading)
             try
             {
-                Log.Information($"Starting to stop download for {Name}...");
+                Log.Information("Starting to stop download for {Name}...", Name);
+                Log.Debug(
+                    "{Name} stop state before: fetchingStopped={StopFetching}, downloadingStopped={StopDownloading}, cacheCount={CacheCount}",
+                    Name, _stopFetchingM3U8, _stopDownloading, _downloadedSegmentsCache.Count);
 
                 // Phase 1: Stop fetching new m3u8
-                _stopFetchingM3u8 = true;
+                _stopFetchingM3U8 = true;
                 Log.Information("Stopping new M3u8 segment fetching...");
 
                 _segmentsChannel.Writer.TryComplete();
@@ -651,11 +675,11 @@ public class ShowroomUtils : DownloadUtils
                 _firstBlockDownloadedEvent.Reset();
 
                 _isDownloading = false;
-                Log.Information($"Download for {Name} has completely stopped");
+                Log.Information("Download for {Name} has completely stopped", Name);
             }
             catch (Exception ex)
             {
-                Log.Error($"Error during stop process: {ex}");
+                Log.Error(ex, "{Name} error during stop process", Name);
                 // Ensure download status is set to false
                 _isDownloading = false;
             }

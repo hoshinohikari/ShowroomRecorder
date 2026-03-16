@@ -1,13 +1,13 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Threading;
 using Serilog;
+using showroom.Utils;
 
 namespace showroom.Download;
 
 public class Minyami(string name, string url) : DownloadUtils(name, url)
 {
-    private const int SIGINT = 2;
+    private const int Sigint = 2;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private Task _downloadTask = null!;
     private Timer? _outputTimer;
@@ -18,6 +18,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         string outputFilePath = null!;
         try
         {
+            Log.Debug("{Name} minyami download start", Name);
             // 检查系统环境变量中是否存在Minyami
             var minyamiExists = Environment.GetEnvironmentVariable("PATH")!
                 .Split(Path.PathSeparator)
@@ -34,9 +35,11 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             var outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
             if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
             outputFilePath = Path.Combine(outputDirectory, $"{Name}_{timestamp}.ts");
+            RecordingRegistry.MarkRecording(outputFilePath);
 
             // 使用Minyami下载m3u8流并保存到本地
             var startInfo = CreateStartInfo(Url, outputFilePath, outputDirectory);
+            Log.Debug("{Name} minyami start: url={Url}, output={Output}", Name, Url, outputFilePath);
 
             _process = new Process { StartInfo = startInfo };
             _process.OutputDataReceived += (_, args) =>
@@ -59,8 +62,9 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
             // 初始化计时器
             _outputTimer = new Timer(OutputTimerCallback, null, TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
 
-            _downloadTask = Task.Run(() => _process.WaitForExit(), _cancellationTokenSource.Token);
+            _downloadTask = _process.WaitForExitAsync(_cancellationTokenSource.Token);
             await _downloadTask;
+            Log.Debug("{Name} minyami exited: code={ExitCode}", Name, _process.ExitCode);
 
             switch (_process.ExitCode)
             {
@@ -85,6 +89,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         }
         finally
         {
+            RecordingRegistry.MarkCompleted(outputFilePath);
             _outputTimer?.Dispose();
             _process?.Dispose();
         }
@@ -118,6 +123,7 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
 
     private void ResetOutputTimer()
     {
+        Log.Verbose("{Name} minyami output heartbeat", Name);
         _outputTimer?.Change(TimeSpan.FromSeconds(10), Timeout.InfiniteTimeSpan);
     }
 
@@ -146,9 +152,8 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             // Windows 平台发送 Ctrl+C 信号
             return SendCtrlCWindows(process.Id);
-        else
-            // Unix 平台发送 SIGINT 信号
-            return kill(process.Id, SIGINT) == 0;
+        // Unix 平台发送 SIGINT 信号
+        return kill(process.Id, Sigint) == 0;
     }
 
     private static bool SendCtrlCWindows(int pid)
@@ -199,19 +204,18 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate? handlerRoutine, bool add);
 
-    private delegate bool ConsoleCtrlDelegate(uint ctrlType);
-
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int pid, int sig);
 
     public override async Task Stop()
     {
+        Log.Debug("{Name} minyami stop requested", Name);
         if (_cancellationTokenSource.IsCancellationRequested) return;
         await _cancellationTokenSource.CancelAsync();
 
         if (_process == null || _process.HasExited) return;
         var delayTask = Task.Delay(TimeSpan.FromSeconds(60));
-        var processExitTask = Task.Run(() => _process.WaitForExit());
+        var processExitTask = _process.WaitForExitAsync();
 
         var completedTask = await Task.WhenAny(delayTask, processExitTask);
 
@@ -221,12 +225,15 @@ public class Minyami(string name, string url) : DownloadUtils(name, url)
         {
             Log.Warning($"{Name} 进程在60秒内未结束，强制终止进程。");
             _process.Kill();
+            Log.Warning("{Name} minyami process killed", Name);
         }
         else
         {
             Log.Information($"{Name} 进程在60秒内正常结束。");
         }
     }
+
+    private delegate bool ConsoleCtrlDelegate(uint ctrlType);
 
     private enum ConsoleCtrlEvent
     {

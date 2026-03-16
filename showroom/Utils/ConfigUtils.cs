@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -7,9 +7,14 @@ namespace showroom.Utils;
 public class Configs
 {
     public bool DebugLog { get; set; } = false;
+    public bool TraceLog { get; set; } = false;
     public bool FileLog { get; set; } = false;
     public double Interval { get; set; } = 20.0;
     public string Proxy { get; set; } = "";
+    public string WebDavUrl { get; set; } = "";
+    public string WebDavUsername { get; set; } = "";
+    public string WebDavPassword { get; set; } = "";
+    public bool WebDavAllowInsecureCertificate { get; set; } = false;
     public string Downloader { get; set; } = "none";
     public string[] Users { get; set; } = [];
     public string SrId { get; set; } = "";
@@ -41,6 +46,9 @@ public static class ConfigUtils
                     .WithNamingConvention(NullNamingConvention.Instance)
                     .Build();
                 Config = deserializer.Deserialize<Configs>(configStr);
+                Log.Debug(
+                    "配置文件加载成功: path={ConfigPath}, users={UserCount}, debug={DebugLog}, trace={TraceLog}, fileLog={FileLog}",
+                    configFilePath, Config.Users.Length, Config.DebugLog, Config.TraceLog, Config.FileLog);
             }
         }
         catch (Exception ex)

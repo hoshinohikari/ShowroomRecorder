@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using Serilog.Events;
 using Serilog.Sinks.SystemConsole.Themes;
 using showroom;
@@ -10,13 +10,14 @@ Log.Logger = new LoggerConfiguration()
     .WriteTo.Console(theme: AnsiConsoleTheme.Sixteen, restrictedToMinimumLevel: LogEventLevel.Information)
     .CreateLogger();
 
+var runtimeMinLevel = ConfigUtils.Config.TraceLog ? LogEventLevel.Verbose : LogEventLevel.Debug;
 var loggerConfig = new LoggerConfiguration()
-    .MinimumLevel.Debug();
+    .MinimumLevel.Is(runtimeMinLevel);
 
 // 添加控制台日志输出
 loggerConfig = ConfigUtils.Config.DebugLog
     ? loggerConfig.WriteTo.Async(a =>
-        a.Console(theme: AnsiConsoleTheme.Sixteen, restrictedToMinimumLevel: LogEventLevel.Debug))
+        a.Console(theme: AnsiConsoleTheme.Sixteen, restrictedToMinimumLevel: runtimeMinLevel))
     : loggerConfig.WriteTo.Async(a =>
         a.Console(theme: AnsiConsoleTheme.Sixteen, restrictedToMinimumLevel: LogEventLevel.Information));
 
@@ -24,9 +25,41 @@ loggerConfig = ConfigUtils.Config.DebugLog
 if (ConfigUtils.Config.FileLog)
     loggerConfig = loggerConfig.WriteTo.Async(a =>
         a.File(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "log.log"),
-            rollingInterval: RollingInterval.Day, restrictedToMinimumLevel: LogEventLevel.Debug));
+            rollingInterval: RollingInterval.Day, restrictedToMinimumLevel: runtimeMinLevel));
 
 Log.Logger = loggerConfig.CreateLogger();
+
+AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+{
+    if (args.ExceptionObject is Exception ex)
+        Log.Fatal(ex, "Unhandled exception, IsTerminating={IsTerminating}", args.IsTerminating);
+    else
+        Log.Fatal("Unhandled non-exception object, IsTerminating={IsTerminating}", args.IsTerminating);
+};
+
+TaskScheduler.UnobservedTaskException += (_, args) =>
+{
+    Log.Error(args.Exception, "Unobserved task exception");
+    args.SetObserved();
+};
+
+Log.Information("ShowroomRecorder starting...");
+Log.Information("Logger minimum level={MinimumLevel}, debugLog={DebugLog}, traceLog={TraceLog}, fileLog={FileLog}",
+    runtimeMinLevel, ConfigUtils.Config.DebugLog, ConfigUtils.Config.TraceLog, ConfigUtils.Config.FileLog);
+Log.Debug(
+    "Config summary: Users={UserCount}, Interval={IntervalSeconds}s, Downloader={Downloader}, ProxyConfigured={ProxyConfigured}, WebDavConfigured={WebDavConfigured}, SrIdConfigured={SrIdConfigured}",
+    ConfigUtils.Config.Users.Length,
+    ConfigUtils.Config.Interval,
+    ConfigUtils.Config.Downloader,
+    !string.IsNullOrWhiteSpace(ConfigUtils.Config.Proxy),
+    !string.IsNullOrWhiteSpace(ConfigUtils.Config.WebDavUrl),
+    !string.IsNullOrWhiteSpace(ConfigUtils.Config.SrId));
+
+if (ConfigUtils.Config.Users.Length == 0)
+    Log.Warning("No users configured, application will idle until shutdown");
+
+await WebDavUploader.InitializeAsync();
+await WebDavUploader.StartBackgroundUploaderAsync();
 
 /*Log.Verbose("hello");
 Log.Debug("hello");
@@ -39,6 +72,7 @@ Log.Fatal("hello");*/
 var online = Online.Instance;
 // 初始化监听器列表
 var listeners = ConfigUtils.Config.Users.Select(n => new Listener(n)).ToList();
+Log.Information("Initialized {ListenerCount} listeners", listeners.Count);
 
 // 捕获 Ctrl+C 事件
 Console.CancelKeyPress += async (_, e) =>
@@ -61,21 +95,28 @@ async Task Cleanup()
 {
     try
     {
+        Log.Information("Cleanup started...");
         List<Task> tasks = [];
         tasks.AddRange(listeners.Select(l => l.Stop()));
         tasks.Add(online.Stop());
+        tasks.Add(WebDavUploader.StopBackgroundUploaderAsync());
 
         await Task.WhenAll(tasks);
+        Log.Information("Cleanup completed");
 
         //await NowConversionTask;
     }
     catch (OperationCanceledException e)
     {
-        Log.Error(e, e.Message);
+        Log.Warning(e, "Cleanup canceled");
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Cleanup failed");
     }
     finally
     {
-        Log.Debug("cancel");
+        Log.Information("Application shutdown");
         Log.CloseAndFlush();
     }
 }

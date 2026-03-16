@@ -1,8 +1,14 @@
 DebugLog: false
+TraceLog: false
 FileLog: false
 Interval: 20
 Proxy: "" # 支持 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+WebDavUrl: "" # 例如 https://webdav.example.com/remote.php/dav/files/username/recordings/
+WebDavUsername: "" # 可留空，留空时尝试匿名访问
+WebDavPassword: "" # 可留空；若填写账号或密码任一项则使用 Basic 认证
+WebDavAllowInsecureCertificate: false # 是否允许忽略 WebDAV 的无效/自签名 TLS 证书
 Downloader: none
 Users: 
 - user1
 - user2
+SrId: ""

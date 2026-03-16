@@ -1,4 +1,4 @@
-﻿namespace showroom.Download;
+namespace showroom.Download;
 
 public abstract class DownloadUtils(string name, string url)
 {
