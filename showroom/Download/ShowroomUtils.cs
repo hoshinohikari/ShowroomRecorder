@@ -11,12 +11,16 @@ namespace showroom.Download;
 
 public class ShowroomUtils : DownloadUtils
 {
+    private const int MaxQueuedSegments = 128;
+    private const int MaxCachedSegments = 256;
+
     private static readonly Regex
         SequenceNumberRegex = new(@"-(\d+)\.ts", RegexOptions.Compiled); // Extract sequence number from path
 
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly ManualResetEventSlim _downloadCompletedEvent = new(false);
     private readonly ConcurrentDictionary<string, byte> _downloadedSegments = new(); // Track downloaded segment paths
+    private readonly ConcurrentDictionary<string, byte> _queuedSegments = new(); // Track queued/in-flight segment paths
 
     private readonly ConcurrentDictionary<long, byte[]>
         _downloadedSegmentsCache = new(); // Store downloaded but not yet merged segments
@@ -28,10 +32,11 @@ public class ShowroomUtils : DownloadUtils
     private readonly Uri? _playlistUri;
 
     private readonly Channel<M3u8Media> _segmentsChannel =
-        Channel.CreateUnbounded<M3u8Media>(new UnboundedChannelOptions
+        Channel.CreateBounded<M3u8Media>(new BoundedChannelOptions(MaxQueuedSegments)
         {
             SingleWriter = true,
-            SingleReader = false
+            SingleReader = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
     private string _combinedFilePath = null!; // Merged file path
@@ -378,14 +383,17 @@ public class ShowroomUtils : DownloadUtils
                         // Note: If M3u8Media doesn't directly provide Duration, adjust based on actual implementation
                         if (segment.Duration > 0) totalMediaDuration += segment.Duration;
 
-                        // Check if segment has already been downloaded (match by Path)
-                        if (_downloadedSegments.ContainsKey(segment.Path)) continue;
+                        // Check if segment has already been queued or downloaded (match by Path)
+                        if (_downloadedSegments.ContainsKey(segment.Path) ||
+                            !_queuedSegments.TryAdd(segment.Path, 0))
+                            continue;
                         try
                         {
                             await _segmentsChannel.Writer.WriteAsync(segment, _cancellationTokenSource.Token);
                         }
                         catch (ChannelClosedException)
                         {
+                            _queuedSegments.TryRemove(segment.Path, out _);
                             Log.Verbose("Segment channel closed, stop adding new segments");
                             _stopFetchingM3U8 = true;
                             break;
@@ -570,6 +578,13 @@ public class ShowroomUtils : DownloadUtils
                     // Only cache segments with recognizable sequence numbers
                     if (currentSequence > 0)
                     {
+                        if (_downloadedSegmentsCache.Count >= MaxCachedSegments)
+                        {
+                            await AbortRecordingAsync(
+                                $"downloaded segment cache exceeded limit {MaxCachedSegments}");
+                            return;
+                        }
+
                         // Add segment to cache
                         _downloadedSegmentsCache.TryAdd(currentSequence, segmentBytes);
 
@@ -583,6 +598,7 @@ public class ShowroomUtils : DownloadUtils
 
                     // Mark segment as downloaded
                     _downloadedSegments.TryAdd(segment.Path, 0);
+                    _queuedSegments.TryRemove(segment.Path, out _);
 
                     // Special log if retry was successful
                     if (retryCount > 0)
@@ -603,6 +619,7 @@ public class ShowroomUtils : DownloadUtils
                 {
                     Log.Warning(
                         $"Failed to download segment after {maxRetries} attempts: {fileName}, no data received");
+                    _queuedSegments.TryRemove(segment.Path, out _);
                     break;
                 }
 
@@ -619,6 +636,7 @@ public class ShowroomUtils : DownloadUtils
                     Log.Error(ex,
                         "{Name} error downloading segment after retries: retries={MaxRetries}, segmentPath={SegmentPath}",
                         Name, maxRetries, segment.Path);
+                    _queuedSegments.TryRemove(segment.Path, out _);
                     break;
                 }
 
