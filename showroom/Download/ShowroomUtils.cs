@@ -38,12 +38,27 @@ public class ShowroomUtils : DownloadUtils
     private Task? _downloadTask;
     private Task? _fetchTask;
     private volatile bool _isDownloading;
+    private volatile bool _mergeFailed;
     private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
     private Task? _mergeTask; // New: merge thread
     private int _nonContinuousRetryCount;
     private volatile bool _stopDownloading;
     private volatile bool _stopFetchingM3U8;
     private long _waitingForSequence = -1;
+
+    private async Task AbortRecordingAsync(string reason, Exception? exception = null)
+    {
+        if (exception == null)
+            Log.Error("{Name} aborting showroom download: {Reason}", Name, reason);
+        else
+            Log.Error(exception, "{Name} aborting showroom download: {Reason}", Name, reason);
+
+        _mergeFailed = true;
+        _stopFetchingM3U8 = true;
+        _stopDownloading = true;
+        _segmentsChannel.Writer.TryComplete();
+        await _cancellationTokenSource.CancelAsync();
+    }
 
     public ShowroomUtils(string name, string url) : base(name, url)
     {
@@ -269,7 +284,7 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "{Name} error during merge process", Name);
+            await AbortRecordingAsync("merge process failed", ex);
         }
         finally
         {
@@ -280,7 +295,11 @@ public class ShowroomUtils : DownloadUtils
                     await currentFileStream.FlushAsync();
                     await currentFileStream.DisposeAsync();
                     Log.Debug($"File stream closed for: {_combinedFilePath}");
-                    UploadCompletedFile(_combinedFilePath);
+                    if (!_mergeFailed && !_cancellationTokenSource.IsCancellationRequested)
+                        UploadCompletedFile(_combinedFilePath);
+                    else
+                        Log.Warning("{Name} recording file left incomplete, upload not marked complete: {FilePath}",
+                            Name, _combinedFilePath);
                 }
                 catch (Exception ex)
                 {
