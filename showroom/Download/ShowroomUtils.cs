@@ -44,12 +44,19 @@ public class ShowroomUtils : DownloadUtils
     private Task? _fetchTask;
     private volatile bool _isDownloading;
     private volatile bool _mergeFailed;
+    private volatile bool _uploadInterruptedRecording;
     private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
     private Task? _mergeTask; // New: merge thread
     private int _nonContinuousRetryCount;
     private volatile bool _stopDownloading;
     private volatile bool _stopFetchingM3U8;
     private long _waitingForSequence = -1;
+
+    private static bool IsDiskFull(Exception exception)
+    {
+        return exception is IOException &&
+               exception.Message.Contains("No space left on device", StringComparison.OrdinalIgnoreCase);
+    }
 
     private async Task AbortRecordingAsync(string reason, Exception? exception = null)
     {
@@ -289,27 +296,47 @@ public class ShowroomUtils : DownloadUtils
         }
         catch (Exception ex)
         {
+            _uploadInterruptedRecording = IsDiskFull(ex);
             await AbortRecordingAsync("merge process failed", ex);
         }
         finally
         {
             // 确保在任务结束时关闭文件流
             if (currentFileStream != null)
+            {
                 try
                 {
                     await currentFileStream.FlushAsync();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "{Name} error flushing file stream", Name);
+                }
+
+                try
+                {
                     await currentFileStream.DisposeAsync();
                     Log.Debug($"File stream closed for: {_combinedFilePath}");
-                    if (!_mergeFailed && !_cancellationTokenSource.IsCancellationRequested)
-                        UploadCompletedFile(_combinedFilePath);
-                    else
-                        Log.Warning("{Name} recording file left incomplete, upload not marked complete: {FilePath}",
-                            Name, _combinedFilePath);
                 }
                 catch (Exception ex)
                 {
                     Log.Error(ex, "{Name} error closing file stream", Name);
                 }
+
+                if (!_mergeFailed && !_cancellationTokenSource.IsCancellationRequested)
+                {
+                    UploadCompletedFile(_combinedFilePath);
+                }
+                else if (_uploadInterruptedRecording)
+                {
+                    UploadInterruptedFile(_combinedFilePath);
+                }
+                else
+                {
+                    Log.Warning("{Name} recording file left incomplete, upload not marked complete: {FilePath}",
+                        Name, _combinedFilePath);
+                }
+            }
         }
     }
 
@@ -322,8 +349,23 @@ public class ShowroomUtils : DownloadUtils
         }
 
         RecordingRegistry.MarkCompleted(filePath);
-        Log.Debug("{Name} completed recording file, upload will be handled by background scanner: {FilePath}", Name,
+        WebDavUploader.EnqueueUpload(filePath);
+        Log.Debug("{Name} completed recording file, upload queued: {FilePath}", Name,
             filePath);
+    }
+
+    private void UploadInterruptedFile(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            Log.Warning("{Name} interrupted upload skipped: file path is empty", Name);
+            return;
+        }
+
+        RecordingRegistry.MarkCompleted(filePath);
+        WebDavUploader.EnqueueUpload(filePath);
+        Log.Warning("{Name} interrupted recording enqueued for WebDAV upload to free local disk: {FilePath}",
+            Name, filePath);
     }
 
     private async Task FetchM3U8ContentAsync()

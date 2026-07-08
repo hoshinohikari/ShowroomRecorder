@@ -180,7 +180,7 @@ public static class WebDavUploader
         }
     }
 
-    private static void EnqueueUpload(string filePath)
+    public static void EnqueueUpload(string filePath)
     {
         if (string.IsNullOrWhiteSpace(filePath))
             return;
