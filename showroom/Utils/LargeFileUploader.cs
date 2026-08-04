@@ -6,9 +6,9 @@ using Serilog;
 namespace showroom.Utils;
 
 /// <summary>
-/// 大文件上传策略（>= UploadConstants.LargeFileThresholdBytes）。
-/// 特点：分块 PATCH 串行上传 + 抽检校验 + 进度持久化 + 僵死检测 + 指数退避重试。
-/// 校验通过后加入后台全量校验队列，最终确认后删本地文件。
+///     大文件上传策略（>= UploadConstants.LargeFileThresholdBytes）。
+///     特点：分块 PATCH 串行上传 + 抽检校验 + 进度持久化 + 僵死检测 + 指数退避重试。
+///     校验通过后加入后台全量校验队列，最终确认后删本地文件。
 /// </summary>
 internal static class LargeFileUploader
 {
@@ -128,7 +128,7 @@ internal static class LargeFileUploader
     }
 
     /// <summary>
-    /// 分块上传，带重试。返回 true 表示全部上传成功。
+    ///     分块上传，带重试。返回 true 表示全部上传成功。
     /// </summary>
     private static async Task<bool> UploadChunksWithRetryAsync(
         string targetUrl, string filePath, long totalSize, long startOffset,
@@ -218,7 +218,7 @@ internal static class LargeFileUploader
     }
 
     /// <summary>
-    /// 上传单个 chunk，带僵死检测。返回 true 表示成功。
+    ///     上传单个 chunk，带僵死检测。返回 true 表示成功。
     /// </summary>
     private static async Task<bool> UploadSingleChunkAsync(
         string targetUrl, string filePath, long offset, long count, CancellationToken cancellationToken)
@@ -355,7 +355,7 @@ internal static class LargeFileUploader
 }
 
 /// <summary>
-/// 上传进度持久化模型。
+///     上传进度持久化模型。
 /// </summary>
 internal class UploadProgress
 {

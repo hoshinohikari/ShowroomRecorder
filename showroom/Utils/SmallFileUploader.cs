@@ -4,8 +4,9 @@ using Serilog;
 namespace showroom.Utils;
 
 /// <summary>
-/// 小文件上传策略（< UploadConstants.LargeFileThresholdBytes）。
-/// 整块 PUT 上传 + 全量完整性校验，简单直接。
+///     小文件上传策略（
+///     < UploadConstants.LargeFileThresholdBytes）。
+///         整块 PUT 上传 + 全量完整性校验， 简单直接。
 /// </summary>
 internal static class SmallFileUploader
 {
@@ -80,8 +81,8 @@ internal static class SmallFileUploader
     }
 
     /// <summary>
-    /// 小文件全量校验：优先用服务端 hash，失败则流式全量比对。
-    /// 校验通过则删除本地文件。
+    ///     小文件全量校验：优先用服务端 hash，失败则流式全量比对。
+    ///     校验通过则删除本地文件。
     /// </summary>
     private static async Task<bool> VerifyAndDeleteLocalAsync(string targetUrl, FileInfo localFileInfo)
     {

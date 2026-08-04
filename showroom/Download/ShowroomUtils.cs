@@ -19,17 +19,18 @@ public class ShowroomUtils : DownloadUtils
 
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly ManualResetEventSlim _downloadCompletedEvent = new(false);
+
+    private readonly SemaphoreSlim _downloadSemaphore = new(8); // Limit max concurrent downloads to 8
     private readonly ConcurrentDictionary<string, byte> _downloadedSegments = new(); // Track downloaded segment paths
-    private readonly ConcurrentDictionary<string, byte> _queuedSegments = new(); // Track queued/in-flight segment paths
 
     private readonly ConcurrentDictionary<long, byte[]>
         _downloadedSegmentsCache = new(); // Store downloaded but not yet merged segments
 
-    private readonly SemaphoreSlim _downloadSemaphore = new(8); // Limit max concurrent downloads to 8
     private readonly ManualResetEventSlim _fetchCompletedEvent = new(false);
     private readonly ManualResetEventSlim _firstBlockDownloadedEvent = new(false);
     private readonly string _outputDirectory;
     private readonly Uri? _playlistUri;
+    private readonly ConcurrentDictionary<string, byte> _queuedSegments = new(); // Track queued/in-flight segment paths
 
     private readonly Channel<M3u8Media> _segmentsChannel =
         Channel.CreateBounded<M3u8Media>(new BoundedChannelOptions(MaxQueuedSegments)
@@ -43,14 +44,25 @@ public class ShowroomUtils : DownloadUtils
     private Task? _downloadTask;
     private Task? _fetchTask;
     private volatile bool _isDownloading;
-    private volatile bool _mergeFailed;
-    private volatile bool _uploadInterruptedRecording;
     private long _lastSequenceNumber = -1; // Track the sequence number of last merged segment
+    private volatile bool _mergeFailed;
     private Task? _mergeTask; // New: merge thread
     private int _nonContinuousRetryCount;
     private volatile bool _stopDownloading;
     private volatile bool _stopFetchingM3U8;
+    private volatile bool _uploadInterruptedRecording;
     private long _waitingForSequence = -1;
+
+    public ShowroomUtils(string name, string url) : base(name, url)
+    {
+        // Set output directory
+        _outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
+        if (!Directory.Exists(_outputDirectory)) Directory.CreateDirectory(_outputDirectory);
+        Uri.TryCreate(url, UriKind.Absolute, out _playlistUri);
+
+        // Create new output file
+        CreateNewOutputFile();
+    }
 
     private static bool IsDiskFull(Exception exception)
     {
@@ -70,17 +82,6 @@ public class ShowroomUtils : DownloadUtils
         _stopDownloading = true;
         _segmentsChannel.Writer.TryComplete();
         await _cancellationTokenSource.CancelAsync();
-    }
-
-    public ShowroomUtils(string name, string url) : base(name, url)
-    {
-        // Set output directory
-        _outputDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video");
-        if (!Directory.Exists(_outputDirectory)) Directory.CreateDirectory(_outputDirectory);
-        Uri.TryCreate(url, UriKind.Absolute, out _playlistUri);
-
-        // Create new output file
-        CreateNewOutputFile();
     }
 
     // Create new output file
@@ -324,18 +325,12 @@ public class ShowroomUtils : DownloadUtils
                 }
 
                 if (!_mergeFailed && !_cancellationTokenSource.IsCancellationRequested)
-                {
                     UploadCompletedFile(_combinedFilePath);
-                }
                 else if (_uploadInterruptedRecording)
-                {
                     UploadInterruptedFile(_combinedFilePath);
-                }
                 else
-                {
                     Log.Warning("{Name} recording file left incomplete, upload not marked complete: {FilePath}",
                         Name, _combinedFilePath);
-                }
             }
         }
     }

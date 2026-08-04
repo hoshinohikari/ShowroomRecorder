@@ -6,7 +6,7 @@ using Serilog;
 namespace showroom.Utils;
 
 /// <summary>
-/// WebDAV 上传的内部常量。全部为硬编码内部值，不暴露给用户配置。
+///     WebDAV 上传的内部常量。全部为硬编码内部值，不暴露给用户配置。
 /// </summary>
 internal static class UploadConstants
 {
@@ -22,14 +22,8 @@ internal static class UploadConstants
     /// <summary>抽检采样点数量。</summary>
     public const int SampleCheckPointCount = 5;
 
-    /// <summary>单 chunk 上传无进度僵死超时。</summary>
-    public static readonly TimeSpan StaleChunkTimeout = TimeSpan.FromMinutes(30);
-
     /// <summary>上传失败最大重试次数（不含首次）。</summary>
     public const int MaxUploadRetries = 3;
-
-    /// <summary>重试指数退避基数。</summary>
-    public static readonly TimeSpan RetryBackoffBase = TimeSpan.FromSeconds(10);
 
     /// <summary>进度文件后缀。</summary>
     public const string ProgressSuffix = ".upload-progress";
@@ -37,18 +31,24 @@ internal static class UploadConstants
     /// <summary>失败文件子目录名。</summary>
     public const string FailedSubdirectory = "failed";
 
-    /// <summary>后台校验队列轮询间隔。</summary>
-    public static readonly TimeSpan VerificationPollInterval = TimeSpan.FromMinutes(5);
-
     /// <summary>服务端 hash 请求短超时（快速路径探测用）。</summary>
     public const double ServerHashQuickTimeoutMs = 30000;
 
     /// <summary>服务端 hash 最大重试次数（后台校验用）。</summary>
     public const int ServerHashMaxRetries = 12; // 12 * 5min = 1h
+
+    /// <summary>单 chunk 上传无进度僵死超时。</summary>
+    public static readonly TimeSpan StaleChunkTimeout = TimeSpan.FromMinutes(30);
+
+    /// <summary>重试指数退避基数。</summary>
+    public static readonly TimeSpan RetryBackoffBase = TimeSpan.FromSeconds(10);
+
+    /// <summary>后台校验队列轮询间隔。</summary>
+    public static readonly TimeSpan VerificationPollInterval = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>
-/// WebDAV 上传相关的公共工具方法，供各上传策略共享。
+///     WebDAV 上传相关的公共工具方法，供各上传策略共享。
 /// </summary>
 internal static class UploadHelpers
 {
@@ -89,7 +89,7 @@ internal static class UploadHelpers
     }
 
     /// <summary>
-    /// 请求服务端 hash（?hash 扩展）。返回 null 表示服务端不支持或请求失败。
+    ///     请求服务端 hash（?hash 扩展）。返回 null 表示服务端不支持或请求失败。
     /// </summary>
     public static async Task<string?> TryGetRemoteSha256Async(string targetUrl, double timeoutMs)
     {
@@ -153,7 +153,7 @@ internal static class UploadHelpers
     }
 
     /// <summary>
-    /// 流式比对两个流的内容是否完全一致。
+    ///     流式比对两个流的内容是否完全一致。
     /// </summary>
     public static async Task<bool> StreamsEqualAsync(Stream localStream, Stream remoteStream)
     {
@@ -183,8 +183,8 @@ internal static class UploadHelpers
     }
 
     /// <summary>
-    /// 抽检式校验：在文件的若干位置各读取一小块与远端比对。
-    /// 对于视频文件等大文件，抽检在极低流量成本下提供很高的可信度。
+    ///     抽检式校验：在文件的若干位置各读取一小块与远端比对。
+    ///     对于视频文件等大文件，抽检在极低流量成本下提供很高的可信度。
     /// </summary>
     public static async Task<bool> SampleVerifyAsync(string targetUrl, FileInfo localFileInfo,
         int sampleCount, int sampleByteCount)
@@ -209,6 +209,7 @@ internal static class UploadHelpers
                 if (n == 0) break;
                 localRead += n;
             }
+
             if (localRead == 0) continue;
             var localSlice = localBuffer.AsMemory(0, localRead);
 
@@ -285,7 +286,7 @@ internal static class UploadHelpers
     }
 
     /// <summary>
-    /// 计算指数退避延迟。retryAttempt 从 1 开始（第一次重试）。
+    ///     计算指数退避延迟。retryAttempt 从 1 开始（第一次重试）。
     /// </summary>
     public static TimeSpan GetRetryDelay(int retryAttempt)
     {
@@ -296,8 +297,8 @@ internal static class UploadHelpers
     }
 
     /// <summary>
-    /// 获取失败文件的存放路径（video/failed/）。如目录不存在则创建。
-    /// 写失败时返回 null，由调用方决定怎么处理。
+    ///     获取失败文件的存放路径（video/failed/）。如目录不存在则创建。
+    ///     写失败时返回 null，由调用方决定怎么处理。
     /// </summary>
     public static string? GetFailedDirectory(string videoFolder)
     {

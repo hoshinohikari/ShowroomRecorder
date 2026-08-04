@@ -117,6 +117,16 @@ public static class WebDavUploader
     private static Task[]? _uploadWorkerTasks;
     private static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    ///     扫描时忽略的文件后缀（标记文件、进度文件等）。
+    /// </summary>
+    private static readonly HashSet<string> SkipSuffixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".recording",
+        UploadConstants.ProgressSuffix,
+        ".log"
+    };
+
     public static async Task InitializeAsync()
     {
         if (_initialized) return;
@@ -210,6 +220,7 @@ public static class WebDavUploader
         {
             baseUrl = _baseUrl;
         }
+
         _verificationQueue = new BackgroundVerificationQueue(baseUrl);
         _verificationQueue.Start(_backgroundCts.Token);
 
@@ -390,7 +401,8 @@ public static class WebDavUploader
             {
                 if (verificationQueue == null)
                 {
-                    Log.Warning("Verification queue not available, falling back to small file uploader for large file: {FileName}",
+                    Log.Warning(
+                        "Verification queue not available, falling back to small file uploader for large file: {FileName}",
                         fileInfo.Name);
                     await SmallFileUploader.ProcessAsync(filePath, baseUrl, cancellationToken);
                 }
@@ -409,14 +421,4 @@ public static class WebDavUploader
             Log.Error(ex, "WebDAV upload failed for {FilePath}", filePath);
         }
     }
-
-    /// <summary>
-    /// 扫描时忽略的文件后缀（标记文件、进度文件等）。
-    /// </summary>
-    private static readonly HashSet<string> SkipSuffixes = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".recording",
-        UploadConstants.ProgressSuffix,
-        ".log"
-    };
 }

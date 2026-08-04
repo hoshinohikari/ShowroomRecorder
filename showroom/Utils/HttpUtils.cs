@@ -11,35 +11,38 @@ using Serilog;
 namespace showroom.Utils;
 
 /// <summary>
-/// 包装一个 Stream，限制最多读取指定字节数。用于分块上传时控制每个 PATCH 请求的内容长度。
+///     包装一个 Stream，限制最多读取指定字节数。用于分块上传时控制每个 PATCH 请求的内容长度。
 /// </summary>
 internal sealed class BoundedReadStream : Stream
 {
     private readonly Stream _inner;
-    private readonly long _maxBytes;
     private long _bytesRead;
 
     public BoundedReadStream(Stream inner, long maxBytes)
     {
         _inner = inner;
-        _maxBytes = maxBytes;
+        Length = maxBytes;
     }
 
     public override bool CanRead => _inner.CanRead;
     public override bool CanSeek => false;
     public override bool CanWrite => false;
-    public override long Length => _maxBytes;
+    public override long Length { get; }
+
     public override long Position
     {
         get => _bytesRead;
         set => throw new NotSupportedException();
     }
 
-    public override void Flush() => _inner.Flush();
+    public override void Flush()
+    {
+        _inner.Flush();
+    }
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        var remaining = _maxBytes - _bytesRead;
+        var remaining = Length - _bytesRead;
         if (remaining <= 0) return 0;
         var toRead = (int)Math.Min(count, remaining);
         var read = _inner.Read(buffer, offset, toRead);
@@ -49,7 +52,7 @@ internal sealed class BoundedReadStream : Stream
 
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        var remaining = _maxBytes - _bytesRead;
+        var remaining = Length - _bytesRead;
         if (remaining <= 0) return 0;
         var toRead = (int)Math.Min(count, remaining);
         var read = await _inner.ReadAsync(buffer, offset, toRead, cancellationToken);
@@ -59,7 +62,7 @@ internal sealed class BoundedReadStream : Stream
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        var remaining = _maxBytes - _bytesRead;
+        var remaining = Length - _bytesRead;
         if (remaining <= 0) return 0;
         var toRead = (int)Math.Min(buffer.Length, remaining);
         var read = await _inner.ReadAsync(buffer[..toRead], cancellationToken);
@@ -67,9 +70,20 @@ internal sealed class BoundedReadStream : Stream
         return read;
     }
 
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        throw new NotSupportedException();
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -747,7 +761,8 @@ public class HttpUtils
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "HTTP PATCH range failed: resource={Resource}, filePath={FilePath}, offset={Offset}, count={Count}",
+            Log.Error(ex,
+                "HTTP PATCH range failed: resource={Resource}, filePath={FilePath}, offset={Offset}, count={Count}",
                 resource, filePath, offset, count);
             return HttpStatusCode.ServiceUnavailable;
         }

@@ -5,21 +5,26 @@ using Serilog;
 namespace showroom.Utils;
 
 /// <summary>
-/// 后台全量校验队列。
-/// 大文件上传完成并通过抽检后，加入此队列进行最终的全量 SHA256 校验。
-/// 校验通过才删除本地文件。校验通过 / 失败 / 超过重试次数都会从队列中移除。
+///     后台全量校验队列。
+///     大文件上传完成并通过抽检后，加入此队列进行最终的全量 SHA256 校验。
+///     校验通过才删除本地文件。校验通过 / 失败 / 超过重试次数都会从队列中移除。
 /// </summary>
 internal sealed class BackgroundVerificationQueue : IDisposable
 {
-    private readonly Channel<VerificationItem> _queue = Channel.CreateUnbounded<VerificationItem>();
-    private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
-    private Task? _workerTask;
-    private CancellationTokenSource? _cts;
     private readonly string _baseUrl;
+    private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Channel<VerificationItem> _queue = Channel.CreateUnbounded<VerificationItem>();
+    private CancellationTokenSource? _cts;
+    private Task? _workerTask;
 
     public BackgroundVerificationQueue(string baseUrl)
     {
         _baseUrl = baseUrl;
+    }
+
+    public void Dispose()
+    {
+        _cts?.Dispose();
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -126,10 +131,8 @@ internal sealed class BackgroundVerificationQueue : IDisposable
                 }
 
                 if (_pending.TryAdd(item.LocalFilePath, 0))
-                {
                     if (!_queue.Writer.TryWrite(item))
                         _pending.TryRemove(item.LocalFilePath, out _);
-                }
             }
         }
 
@@ -167,6 +170,7 @@ internal sealed class BackgroundVerificationQueue : IDisposable
                 {
                     Log.Warning(ex, "Failed to delete local file after verification: {FileName}", fileName);
                 }
+
                 return false;
             }
 
@@ -194,11 +198,6 @@ internal sealed class BackgroundVerificationQueue : IDisposable
 
         // 需要重试
         return true;
-    }
-
-    public void Dispose()
-    {
-        _cts?.Dispose();
     }
 }
 
