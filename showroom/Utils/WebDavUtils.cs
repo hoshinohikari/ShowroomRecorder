@@ -1,7 +1,4 @@
 using System.Collections.Concurrent;
-using System.Net;
-using System.Security.Cryptography;
-using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Serilog;
 
@@ -9,6 +6,7 @@ namespace showroom.Utils;
 
 public static class RecordingRegistry
 {
+    private const string RecordingSuffix = ".recording";
     private static readonly ConcurrentDictionary<string, byte> ActiveFiles = new(StringComparer.OrdinalIgnoreCase);
 
     public static void MarkRecording(string filePath)
@@ -17,6 +15,23 @@ public static class RecordingRegistry
             return;
         var fullPath = Path.GetFullPath(filePath);
         ActiveFiles[fullPath] = 0;
+
+        try
+        {
+            var markerPath = GetMarkerPath(fullPath);
+            var directory = Path.GetDirectoryName(markerPath);
+            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                Directory.CreateDirectory(directory);
+            File.WriteAllText(markerPath,
+                DateTimeOffset.UtcNow.ToString("O"));
+            Log.Verbose("Recording marker written: {MarkerPath}", markerPath);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to write recording marker for {FilePath}", fullPath);
+            // 标记文件写入失败不影响录制流程
+        }
+
         Log.Verbose("Recording file tracked: {FilePath}", fullPath);
     }
 
@@ -26,6 +41,21 @@ public static class RecordingRegistry
             return;
         var fullPath = Path.GetFullPath(filePath);
         ActiveFiles.TryRemove(fullPath, out _);
+
+        try
+        {
+            var markerPath = GetMarkerPath(fullPath);
+            if (File.Exists(markerPath))
+            {
+                File.Delete(markerPath);
+                Log.Verbose("Recording marker removed: {MarkerPath}", markerPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to remove recording marker for {FilePath}", fullPath);
+        }
+
         Log.Verbose("Recording file untracked: {FilePath}", fullPath);
     }
 
@@ -34,16 +64,46 @@ public static class RecordingRegistry
         if (string.IsNullOrWhiteSpace(filePath))
             return false;
         var fullPath = Path.GetFullPath(filePath);
-        return ActiveFiles.ContainsKey(fullPath);
+        if (ActiveFiles.ContainsKey(fullPath))
+            return true;
+
+        // 内存中没有记录时，检查磁盘上的 .recording 标记文件
+        // 这用于处理程序重启后，遗留的正在录制中的文件
+        try
+        {
+            var markerPath = GetMarkerPath(fullPath);
+            if (File.Exists(markerPath))
+            {
+                // 如果标记文件存在且超过 2 小时没有更新，视为崩溃遗留的孤儿标记
+                // 仍然返回 true（避免上传半截文件），但打个 warning
+                var markerAge = DateTime.UtcNow - File.GetLastWriteTimeUtc(markerPath);
+                if (markerAge > TimeSpan.FromHours(2))
+                    Log.Warning(
+                        "Stale recording marker detected (age={Age:hh\\:mm}), file still treated as recording: {FilePath}",
+                        markerAge, fullPath);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Verbose(ex, "Failed to check recording marker for {FilePath}", fullPath);
+        }
+
+        return false;
+    }
+
+    private static string GetMarkerPath(string fullFilePath)
+    {
+        return fullFilePath + RecordingSuffix;
     }
 }
 
 public static class WebDavUploader
 {
     private const int MaxConcurrentUploads = 5;
-    private const double HashRequestTimeoutMs = 180000;
     private static readonly SemaphoreSlim InitLock = new(1, 1);
     private static readonly Lock StateLock = new();
+    private static BackgroundVerificationQueue? _verificationQueue;
 
     private static readonly Channel<string> UploadQueue = Channel.CreateUnbounded<string>(
         new UnboundedChannelOptions { SingleReader = false, SingleWriter = false });
@@ -112,7 +172,7 @@ public static class WebDavUploader
         Log.Debug("WebDAV base URL: {BaseUrl}", _baseUrl);
 
         var testFileName = $".showroomrecorder_upload_test_{Guid.NewGuid():N}.txt";
-        var testUrl = BuildTargetUrl(_baseUrl, testFileName);
+        var testUrl = UploadHelpers.BuildTargetUrl(_baseUrl, testFileName);
         try
         {
             var testPayload = "showroomrecorder webdav test"u8.ToArray();
@@ -143,6 +203,16 @@ public static class WebDavUploader
             return Task.CompletedTask;
 
         _backgroundCts = new CancellationTokenSource();
+
+        // 初始化后台校验队列（大文件上传后做延迟全量校验）
+        string baseUrl;
+        lock (StateLock)
+        {
+            baseUrl = _baseUrl;
+        }
+        _verificationQueue = new BackgroundVerificationQueue(baseUrl);
+        _verificationQueue.Start(_backgroundCts.Token);
+
         _scanTask = Task.Run(() => RunScannerAsync(_backgroundCts.Token));
         _uploadWorkerTasks = Enumerable.Range(0, MaxConcurrentUploads)
             .Select(i => Task.Run(() => RunUploadWorkerAsync(i + 1, _backgroundCts.Token)))
@@ -161,6 +231,8 @@ public static class WebDavUploader
             await _backgroundCts.CancelAsync();
             await _scanTask;
             await Task.WhenAll(_uploadWorkerTasks);
+            if (_verificationQueue != null)
+                await _verificationQueue.StopAsync();
             Log.Information("WebDAV background uploader stopped");
         }
         catch (OperationCanceledException)
@@ -257,6 +329,17 @@ public static class WebDavUploader
             foreach (var filePath in Directory.EnumerateFiles(videoFolder))
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // 跳过标记文件、进度文件、日志等非视频文件
+                var ext = Path.GetExtension(filePath);
+                if (SkipSuffixes.Contains(ext))
+                    continue;
+
+                // 跳过 failed 子目录里的文件
+                var dirName = Path.GetFileName(Path.GetDirectoryName(filePath));
+                if (string.Equals(dirName, UploadConstants.FailedSubdirectory, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 if (RecordingRegistry.IsRecording(filePath))
                     continue;
                 EnqueueUpload(filePath);
@@ -277,6 +360,7 @@ public static class WebDavUploader
 
         string baseUrl;
         var enabled = _enabled;
+        var verificationQueue = _verificationQueue;
 
         lock (StateLock)
         {
@@ -301,70 +385,23 @@ public static class WebDavUploader
 
             var fileInfo = new FileInfo(filePath);
 
-            var targetUrl = BuildTargetUrl(baseUrl, fileInfo.Name);
-            Log.Debug("WebDAV uploading file: {FileName}, bytes={Length}", fileInfo.Name, fileInfo.Length);
-
-            var (headStatus, remoteSize, headError) = await WebDavHttp.HeadContentLength(targetUrl, 30000);
-            var shouldPreVerify = false;
-            if (headStatus == HttpStatusCode.OK && remoteSize.HasValue)
+            // 按文件大小分发到不同策略
+            if (fileInfo.Length >= UploadConstants.LargeFileThresholdBytes)
             {
-                shouldPreVerify = true;
-                if (remoteSize.Value == fileInfo.Length)
+                if (verificationQueue == null)
                 {
-                    Log.Debug("WebDAV remote file size already matches local, start verify: {FileName}", fileInfo.Name);
-                    if (await VerifyRemoteAndDeleteLocalAsync(targetUrl, fileInfo))
-                        return;
-                    Log.Warning("WebDAV remote size matches but content verify failed, re-upload: {FileName}",
+                    Log.Warning("Verification queue not available, falling back to small file uploader for large file: {FileName}",
                         fileInfo.Name);
+                    await SmallFileUploader.ProcessAsync(filePath, baseUrl, cancellationToken);
                 }
-                else if (remoteSize.Value > 0 && remoteSize.Value < fileInfo.Length)
+                else
                 {
-                    Log.Information(
-                        "WebDAV resume upload by PATCH append: {FileName}, remoteSize={RemoteSize}, localSize={LocalSize}",
-                        fileInfo.Name, remoteSize.Value, fileInfo.Length);
-                    var patchStatus = await WebDavHttp.PatchAppendFile(
-                        targetUrl,
-                        filePath,
-                        remoteSize.Value,
-                        "application/octet-stream");
-                    if ((int)patchStatus is >= 200 and < 300)
-                    {
-                        Log.Information("WebDAV resumed upload: {FileName}", fileInfo.Name);
-                        await TryApplyRemoteTimestampsAsync(targetUrl, fileInfo);
-                        _ = await VerifyRemoteAndDeleteLocalAsync(targetUrl, fileInfo);
-                        return;
-                    }
-
-                    Log.Warning("WebDAV resume upload failed for {FileName}: {StatusCode}", fileInfo.Name, patchStatus);
+                    await LargeFileUploader.ProcessAsync(filePath, baseUrl, verificationQueue, cancellationToken);
                 }
-                else if (remoteSize.Value > fileInfo.Length)
-                {
-                    Log.Warning(
-                        "WebDAV remote file larger than local, force overwrite upload: {FileName}, remote={RemoteSize}, local={LocalSize}",
-                        fileInfo.Name, remoteSize.Value, fileInfo.Length);
-                }
-            }
-            else if (headStatus is not (HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed))
-            {
-                Log.Verbose("WebDAV HEAD unavailable before upload: status={Status}, error={Error}", headStatus,
-                    headError);
-            }
-
-            // Only pre-verify when remote object is known to exist.
-            if (shouldPreVerify)
-                if (await VerifyRemoteAndDeleteLocalAsync(targetUrl, fileInfo))
-                    return;
-
-            var putStatus = await WebDavHttp.PutFile(targetUrl, filePath, "application/octet-stream");
-            if ((int)putStatus is >= 200 and < 300)
-            {
-                Log.Information("WebDAV uploaded: {FileName}", fileInfo.Name);
-                await TryApplyRemoteTimestampsAsync(targetUrl, fileInfo);
-                _ = await VerifyRemoteAndDeleteLocalAsync(targetUrl, fileInfo);
             }
             else
             {
-                Log.Error("WebDAV upload failed for {FileName}: {StatusCode}", fileInfo.Name, putStatus);
+                await SmallFileUploader.ProcessAsync(filePath, baseUrl, cancellationToken);
             }
         }
         catch (Exception ex)
@@ -373,187 +410,13 @@ public static class WebDavUploader
         }
     }
 
-    private static string BuildTargetUrl(string baseUrl, string fileName)
+    /// <summary>
+    /// 扫描时忽略的文件后缀（标记文件、进度文件等）。
+    /// </summary>
+    private static readonly HashSet<string> SkipSuffixes = new(StringComparer.OrdinalIgnoreCase)
     {
-        return $"{baseUrl}{Uri.EscapeDataString(fileName)}";
-    }
-
-    private static async Task TryApplyRemoteTimestampsAsync(string targetUrl, FileInfo localFileInfo)
-    {
-        try
-        {
-            var status = await WebDavHttp.ProppatchTimestamps(
-                targetUrl,
-                localFileInfo.CreationTimeUtc,
-                localFileInfo.LastWriteTimeUtc,
-                30000);
-
-            if ((int)status is >= 200 and < 300 || status == HttpStatusCode.MultiStatus)
-                Log.Debug(
-                    "WebDAV timestamps synced: {FileName}, createdUtc={CreatedUtc:o}, modifiedUtc={ModifiedUtc:o}",
-                    localFileInfo.Name, localFileInfo.CreationTimeUtc, localFileInfo.LastWriteTimeUtc);
-            else
-                Log.Warning("WebDAV timestamp sync unsupported or failed: {FileName}, status={StatusCode}",
-                    localFileInfo.Name, status);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "WebDAV timestamp sync failed: {FileName}", localFileInfo.Name);
-        }
-    }
-
-    private static async Task<bool> VerifyRemoteAndDeleteLocalAsync(string targetUrl, FileInfo localFileInfo)
-    {
-        try
-        {
-            if (!localFileInfo.Exists)
-            {
-                Log.Warning("Skip verify, local file missing: {FilePath}", localFileInfo.FullName);
-                return false;
-            }
-
-            // Preferred fast-path: ask server to compute hash via "?hash".
-            var remoteSha256 = await TryGetRemoteSha256Async(targetUrl);
-            if (!string.IsNullOrWhiteSpace(remoteSha256))
-            {
-                var localSha256 = await ComputeSha256HexAsync(localFileInfo.FullName);
-                if (string.Equals(localSha256, remoteSha256, StringComparison.OrdinalIgnoreCase))
-                {
-                    localFileInfo.Delete();
-                    Log.Information("WebDAV verify success by server hash, deleted local file: {FilePath}",
-                        localFileInfo.FullName);
-                    return true;
-                }
-
-                Log.Warning(
-                    "WebDAV verify failed for {FileName}: server hash mismatch, keep local file (local={LocalHash}, remote={RemoteHash})",
-                    localFileInfo.Name, localSha256, remoteSha256);
-                return false;
-            }
-
-            Log.Debug("WebDAV server hash unavailable, fallback to stream comparison for {FileName}",
-                localFileInfo.Name);
-            await using var remoteStream = await WebDavHttp.DownloadStream(targetUrl, [], 30000);
-            if (remoteStream == null)
-            {
-                Log.Warning("WebDAV verify failed for {FileName}: remote stream unavailable", localFileInfo.Name);
-                return false;
-            }
-
-            await using var localStream = File.OpenRead(localFileInfo.FullName);
-            var isSame = await StreamsEqualAsync(localStream, remoteStream);
-            if (!isSame)
-            {
-                Log.Warning("WebDAV verify failed for {FileName}: content mismatch, keep local file",
-                    localFileInfo.Name);
-                return false;
-            }
-
-            localFileInfo.Delete();
-            Log.Information("WebDAV verify success, deleted local file: {FilePath}", localFileInfo.FullName);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "WebDAV verify/delete failed for {FilePath}, keep local file", localFileInfo.FullName);
-            return false;
-        }
-    }
-
-    private static async Task<string?> TryGetRemoteSha256Async(string targetUrl)
-    {
-        try
-        {
-            var hashUrl = targetUrl.Contains('?')
-                ? $"{targetUrl}&hash"
-                : $"{targetUrl}?hash";
-
-            var (statusCode, content) = await WebDavHttp.Get(hashUrl, [], HashRequestTimeoutMs);
-            if (statusCode != HttpStatusCode.OK || string.IsNullOrWhiteSpace(content))
-            {
-                Log.Verbose("WebDAV hash endpoint unavailable: status={StatusCode}", statusCode);
-                return null;
-            }
-
-            var raw = NormalizeHashPayload(content);
-            Log.Debug("WebDAV hash payload received: length={Length}, preview={Preview}",
-                raw.Length, raw.Length > 120 ? raw[..120] : raw);
-            if (TryExtractSha256(raw, out var hash))
-            {
-                Log.Verbose("WebDAV hash endpoint returned valid sha256");
-                return hash;
-            }
-
-            Log.Warning("WebDAV hash endpoint returned non-sha256 payload: length={Length}", raw.Length);
-
-            return null;
-        }
-        catch (Exception ex)
-        {
-            Log.Verbose(ex, "WebDAV hash endpoint request failed");
-            return null;
-        }
-    }
-
-    private static string NormalizeHashPayload(string raw)
-    {
-        if (string.IsNullOrEmpty(raw))
-            return string.Empty;
-
-        // Keep visible ASCII for hash extraction and strip common control characters.
-        var cleaned = raw
-            .Replace("\r", string.Empty)
-            .Replace("\n", string.Empty)
-            .Replace("\t", string.Empty)
-            .Trim();
-        return cleaned;
-    }
-
-    private static bool TryExtractSha256(string raw, out string hash)
-    {
-        hash = string.Empty;
-        if (string.IsNullOrWhiteSpace(raw))
-            return false;
-
-        var match = Regex.Match(raw, "(?i)\\b[a-f0-9]{64}\\b");
-        if (!match.Success)
-            return false;
-
-        hash = match.Value;
-        return true;
-    }
-
-    private static async Task<string> ComputeSha256HexAsync(string filePath)
-    {
-        await using var stream = File.OpenRead(filePath);
-        var bytes = await SHA256.HashDataAsync(stream);
-        return Convert.ToHexString(bytes).ToLowerInvariant();
-    }
-
-    private static async Task<bool> StreamsEqualAsync(Stream localStream, Stream remoteStream)
-    {
-        var localBuffer = new byte[64 * 1024];
-        var remoteBuffer = new byte[64 * 1024];
-        var comparedBytes = 0L;
-
-        while (true)
-        {
-            var localRead = await localStream.ReadAsync(localBuffer.AsMemory(0, localBuffer.Length));
-            var remoteRead = await remoteStream.ReadAsync(remoteBuffer.AsMemory(0, remoteBuffer.Length));
-
-            if (localRead != remoteRead)
-                return false;
-
-            if (localRead == 0)
-            {
-                Log.Verbose("WebDAV stream compare finished, bytes={ComparedBytes}", comparedBytes);
-                return true;
-            }
-
-            if (!localBuffer.AsSpan(0, localRead).SequenceEqual(remoteBuffer.AsSpan(0, remoteRead)))
-                return false;
-
-            comparedBytes += localRead;
-        }
-    }
+        ".recording",
+        UploadConstants.ProgressSuffix,
+        ".log"
+    };
 }

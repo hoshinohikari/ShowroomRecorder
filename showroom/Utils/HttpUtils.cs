@@ -10,6 +10,74 @@ using Serilog;
 
 namespace showroom.Utils;
 
+/// <summary>
+/// 包装一个 Stream，限制最多读取指定字节数。用于分块上传时控制每个 PATCH 请求的内容长度。
+/// </summary>
+internal sealed class BoundedReadStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly long _maxBytes;
+    private long _bytesRead;
+
+    public BoundedReadStream(Stream inner, long maxBytes)
+    {
+        _inner = inner;
+        _maxBytes = maxBytes;
+    }
+
+    public override bool CanRead => _inner.CanRead;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => _maxBytes;
+    public override long Position
+    {
+        get => _bytesRead;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush() => _inner.Flush();
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var remaining = _maxBytes - _bytesRead;
+        if (remaining <= 0) return 0;
+        var toRead = (int)Math.Min(count, remaining);
+        var read = _inner.Read(buffer, offset, toRead);
+        _bytesRead += read;
+        return read;
+    }
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        var remaining = _maxBytes - _bytesRead;
+        if (remaining <= 0) return 0;
+        var toRead = (int)Math.Min(count, remaining);
+        var read = await _inner.ReadAsync(buffer, offset, toRead, cancellationToken);
+        _bytesRead += read;
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var remaining = _maxBytes - _bytesRead;
+        if (remaining <= 0) return 0;
+        var toRead = (int)Math.Min(buffer.Length, remaining);
+        var read = await _inner.ReadAsync(buffer[..toRead], cancellationToken);
+        _bytesRead += read;
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        // 不释放内部流 —— 外部的 FileStream 会自己释放
+        base.Dispose(disposing);
+    }
+}
+
 public static class ShowroomHttp
 {
     private static readonly HttpUtils HttpUtils;
@@ -166,6 +234,13 @@ public static class WebDavHttp
     {
         var (client, resolvedResource) = ResolveClientAndResource(resource);
         return await client.PatchAppendFile(resolvedResource, filePath, offset, contentType, timeoutMs);
+    }
+
+    public static async Task<HttpStatusCode> PatchAppendRange(string resource, string filePath, long offset, long count,
+        string contentType, double? timeoutMs = null)
+    {
+        var (client, resolvedResource) = ResolveClientAndResource(resource);
+        return await client.PatchAppendRange(resolvedResource, filePath, offset, count, contentType, timeoutMs);
     }
 }
 
@@ -625,6 +700,55 @@ public class HttpUtils
         {
             Log.Error(ex, "HTTP PATCH append failed: resource={Resource}, filePath={FilePath}, offset={Offset}",
                 resource, filePath, offset);
+            return HttpStatusCode.ServiceUnavailable;
+        }
+    }
+
+    public async Task<HttpStatusCode> PatchAppendRange(string resource, string filePath, long offset, long count,
+        string contentType = "application/octet-stream", double? timeoutMs = null)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+                return HttpStatusCode.NotFound;
+
+            await using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            if (offset < 0 || offset > stream.Length)
+                return HttpStatusCode.RequestedRangeNotSatisfiable;
+            if (count < 0 || offset + count > stream.Length)
+                count = stream.Length - offset;
+
+            stream.Seek(offset, SeekOrigin.Begin);
+            // 使用 BoundedStream 限制读取的字节数
+            var boundedStream = new BoundedReadStream(stream, count);
+            using var content = new StreamContent(boundedStream, 128 * 1024);
+            content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+            content.Headers.ContentLength = count;
+
+            using var request = new HttpRequestMessage(new HttpMethod("PATCH"), resource);
+            request.Version = HttpVersion.Version11;
+            request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+            request.Content = content;
+            request.Headers.ExpectContinue = false;
+            request.Headers.TryAddWithoutValidation("X-Update-Range", "append");
+            AddUploadHeaders(request);
+
+            var patchTimeout = GetPatchTimeout(timeoutMs, count);
+            using var cts = new CancellationTokenSource(patchTimeout);
+            using var response =
+                await _streamingClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            if ((int)response.StatusCode is >= 200 and < 300)
+                return response.StatusCode;
+
+            Log.Warning("HTTP PATCH range non-OK: resource={Resource}, status={Status}, offset={Offset}, count={Count}",
+                resource, response.StatusCode, offset, count);
+            return response.StatusCode;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "HTTP PATCH range failed: resource={Resource}, filePath={FilePath}, offset={Offset}, count={Count}",
+                resource, filePath, offset, count);
             return HttpStatusCode.ServiceUnavailable;
         }
     }
