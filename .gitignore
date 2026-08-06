@@ -396,3 +396,12 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Local agent/docs files (kept out of tracking)
+CLAUDE.md
+CONTEXT.md
+docs/
+architecture-review-*.html
+
+# macOS
+.DS_Store
