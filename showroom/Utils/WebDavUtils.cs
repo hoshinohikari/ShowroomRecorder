@@ -221,7 +221,7 @@ public static class WebDavUploader
             baseUrl = _baseUrl;
         }
 
-        _verificationQueue = new BackgroundVerificationQueue(baseUrl);
+        _verificationQueue = new BackgroundVerificationQueue();
         _verificationQueue.Start(_backgroundCts.Token);
 
         _scanTask = Task.Run(() => RunScannerAsync(_backgroundCts.Token));

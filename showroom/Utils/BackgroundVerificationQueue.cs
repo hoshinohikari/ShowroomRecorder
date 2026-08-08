@@ -11,16 +11,10 @@ namespace showroom.Utils;
 /// </summary>
 internal sealed class BackgroundVerificationQueue : IDisposable
 {
-    private readonly string _baseUrl;
     private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly Channel<VerificationItem> _queue = Channel.CreateUnbounded<VerificationItem>();
     private CancellationTokenSource? _cts;
     private Task? _workerTask;
-
-    public BackgroundVerificationQueue(string baseUrl)
-    {
-        _baseUrl = baseUrl;
-    }
 
     public void Dispose()
     {
