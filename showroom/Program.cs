@@ -70,9 +70,9 @@ Log.Fatal("hello");*/
 
 // 初始化在线检测（单例会在首次访问时启动）
 var online = Online.Instance;
-// 初始化监听器列表
-var listeners = ConfigUtils.Config.Users.Select(n => new Listener(n)).ToList();
-Log.Information("Initialized {ListenerCount} listeners", listeners.Count);
+// 初始化用户管理器（负责监听 Users 列表热重载）
+var userManager = new UserManager();
+Log.Information("UserManager initialized");
 
 // 捕获 Ctrl+C 事件
 Console.CancelKeyPress += async (_, e) =>
@@ -97,9 +97,10 @@ async Task Cleanup()
     {
         Log.Information("Cleanup started...");
         List<Task> tasks = [];
-        tasks.AddRange(listeners.Select(l => l.Stop()));
+        tasks.Add(userManager.StopAsync());
         tasks.Add(online.Stop());
         tasks.Add(WebDavUploader.StopBackgroundUploaderAsync());
+        ConfigUtils.Stop();
 
         await Task.WhenAll(tasks);
         Log.Information("Cleanup completed");

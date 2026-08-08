@@ -14,6 +14,9 @@ public class Listener
     private long _id;
     private DateTime _lastApiCheck = DateTime.UtcNow;
     private Recorder? _recorder;
+    private volatile bool _started;
+
+    public bool Started => _started;
 
     public Listener(string name)
     {
@@ -97,6 +100,8 @@ public class Listener
         }
 
         Log.Debug("get {Name} user id is {Id}", _name, _id);
+
+        _started = true;
 
         // 初始化随机接口检查间隔（20~40 倍配置间隔）
         _apiCheckInterval = GetRandomApiInterval();
