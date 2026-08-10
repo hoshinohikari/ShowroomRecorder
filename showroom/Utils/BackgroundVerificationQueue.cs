@@ -54,16 +54,28 @@ internal sealed class BackgroundVerificationQueue : IDisposable
         }
     }
 
+    /// <summary>
+    ///     判断文件是否已在后台校验队列中（正在等待或正在做全量 hash 校验）。
+    ///     用于避免扫描器/上传流程对同一文件重复入队、重复检测。
+    /// </summary>
+    public bool Contains(string localFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(localFilePath))
+            return false;
+        var fullPath = Path.GetFullPath(localFilePath);
+        return _pending.ContainsKey(fullPath);
+    }
+
     public void Enqueue(string targetUrl, string localFilePath, string localHash)
     {
-        var key = localFilePath;
+        var key = Path.GetFullPath(localFilePath);
         if (!_pending.TryAdd(key, 0))
             return; // 已经在队列里了
 
         var item = new VerificationItem
         {
             TargetUrl = targetUrl,
-            LocalFilePath = localFilePath,
+            LocalFilePath = key,
             LocalHash = localHash,
             RetryCount = 0
         };

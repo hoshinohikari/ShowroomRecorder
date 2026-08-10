@@ -26,6 +26,16 @@ internal static class LargeFileUploader
                 return;
             }
 
+            // 文件已在后台全量 hash 校验队列中（大文件上传后由抽检通过进入后台校验）。
+            // 此时不应重复上传/重复入队/重复检测，直接跳过，等待后台校验完成后再由扫描器决定。
+            if (verificationQueue.Contains(filePath))
+            {
+                Log.Debug(
+                    "WebDAV large upload skipped, file already in background verification queue: {FileName}",
+                    fileInfo.Name);
+                return;
+            }
+
             targetUrl = UploadHelpers.BuildTargetUrl(baseUrl, fileInfo.Name);
             Log.Information("WebDAV large upload starting: {FileName}, size={SizeGB:F2} GB",
                 fileInfo.Name, fileInfo.Length / (1024.0 * 1024 * 1024));
