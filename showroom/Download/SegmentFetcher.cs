@@ -7,20 +7,22 @@ using HttpStatusCode = System.Net.HttpStatusCode;
 namespace showroom.Download;
 
 /// <summary>轮询 m3u8 播放清单，把未下载的段描述写入信道。不碰任何下载状态。</summary>
-public sealed class SegmentFetcher(string name, string url, PipelineState state)
+public sealed class SegmentFetcher
 {
     private const int MaxRetries = 5;
     private static readonly TimeSpan DefaultWaitTime = TimeSpan.FromSeconds(4);
 
-    private readonly string _name = name;
-    private readonly string _url = url;
-    private readonly PipelineState _state = state;
-    private readonly Func<string, Task<(HttpStatusCode, string)>> _get = null!;
+    private readonly string _name;
+    private readonly string _url;
+    private readonly PipelineState _state;
+    private readonly Func<string, Task<(HttpStatusCode, string)>> _get;
 
     public SegmentFetcher(string name, string url, PipelineState state,
         Func<string, Task<(HttpStatusCode, string)>>? get = null)
-        : this(name, url, state)
     {
+        _name = name;
+        _url = url;
+        _state = state;
         _get = get ?? (r => ShowroomDownloadHttp.Get(r, [], 2000));
     }
 
