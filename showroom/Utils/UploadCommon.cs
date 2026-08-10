@@ -213,14 +213,10 @@ internal static class UploadHelpers
             if (localRead == 0) continue;
             var localSlice = localBuffer.AsMemory(0, localRead);
 
-            // 读远端（HTTP Range）
-            var rangeEnd = offset + localRead - 1;
-            var rangeHeader = new List<(string, string)>
-            {
-                ("Range", $"bytes={offset}-{rangeEnd}")
-            };
-
-            var remoteBytes = await WebDavHttp.DownloadFile(targetUrl, rangeHeader, 30000);
+            // 读远端（HTTP Range），用流式读取而非 DownloadFile。
+            // DownloadFile 会把整个响应读进内存：若服务端忽略 Range 头返回整个文件，
+            // 大文件会直接 OOM（ReadAsBytes -> MemoryStream.EnsureCapacity）。流式只读所需字节即可。
+            var remoteBytes = await ReadRemoteRangeAsync(targetUrl, offset, localRead);
             if (remoteBytes.Length != localRead)
             {
                 Log.Warning(
@@ -241,6 +237,45 @@ internal static class UploadHelpers
         Log.Debug("WebDAV sample verify passed: {FileName}, samples={SampleCount}, bytesPerSample={SampleBytes}",
             localFileInfo.Name, sampleCount, sampleByteCount);
         return true;
+    }
+
+    /// <summary>
+    ///     流式读取远端指定范围 [offset, offset+count) 的字节。
+    ///     相比 DownloadFile（整响应读入内存），当服务端忽略 Range 头返回整个文件时，
+    ///     这里只读取前 count 字节就停止，避免大文件 OOM。服务端不支持 Range 时会退化为读取文件开头。
+    /// </summary>
+    private static async Task<byte[]> ReadRemoteRangeAsync(string targetUrl, long offset, int count)
+    {
+        var rangeEnd = offset + count - 1;
+        var rangeHeader = new List<(string, string)>
+        {
+            ("Range", $"bytes={offset}-{rangeEnd}")
+        };
+
+        var stream = await WebDavHttp.DownloadStream(targetUrl, rangeHeader, 30000);
+        if (stream == null)
+            return Array.Empty<byte>();
+
+        try
+        {
+            var buffer = new byte[count];
+            var totalRead = 0;
+            while (totalRead < count)
+            {
+                var n = await stream.ReadAsync(buffer.AsMemory(totalRead));
+                if (n == 0) break;
+                totalRead += n;
+            }
+
+            // 只保留实际读到的字节
+            if (totalRead == count)
+                return buffer;
+            return buffer.AsMemory(0, totalRead).ToArray();
+        }
+        finally
+        {
+            await stream.DisposeAsync();
+        }
     }
 
     private static List<long> GenerateSampleOffsets(long fileSize, int sampleCount, int sampleByteCount)
