@@ -43,17 +43,11 @@ internal static class UploadConstants
     /// <summary>按文件大小估算的 hash 请求超时上限（毫秒），防止超大文件长时间占用 worker。</summary>
     public const double ServerHashMaxTimeoutMs = 30 * 60 * 1000; // 30 min
 
-    /// <summary>服务端 hash 最大重试次数（后台校验用）。</summary>
-    public const int ServerHashMaxRetries = 12; // 12 * 5min = 1h
-
     /// <summary>单 chunk 上传无进度僵死超时。</summary>
     public static readonly TimeSpan StaleChunkTimeout = TimeSpan.FromMinutes(30);
 
     /// <summary>重试指数退避基数。</summary>
     public static readonly TimeSpan RetryBackoffBase = TimeSpan.FromSeconds(10);
-
-    /// <summary>后台校验队列轮询间隔。</summary>
-    public static readonly TimeSpan VerificationPollInterval = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>

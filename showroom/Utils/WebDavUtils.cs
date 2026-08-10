@@ -103,7 +103,6 @@ public static class WebDavUploader
     private const int MaxConcurrentUploads = 5;
     private static readonly SemaphoreSlim InitLock = new(1, 1);
     private static readonly Lock StateLock = new();
-    private static BackgroundVerificationQueue? _verificationQueue;
 
     private static readonly Channel<string> UploadQueue = Channel.CreateUnbounded<string>(
         new UnboundedChannelOptions { SingleReader = false, SingleWriter = false });
@@ -214,16 +213,6 @@ public static class WebDavUploader
 
         _backgroundCts = new CancellationTokenSource();
 
-        // 初始化后台校验队列（大文件上传后做延迟全量校验）
-        string baseUrl;
-        lock (StateLock)
-        {
-            baseUrl = _baseUrl;
-        }
-
-        _verificationQueue = new BackgroundVerificationQueue();
-        _verificationQueue.Start(_backgroundCts.Token);
-
         _scanTask = Task.Run(() => RunScannerAsync(_backgroundCts.Token));
         _uploadWorkerTasks = Enumerable.Range(0, MaxConcurrentUploads)
             .Select(i => Task.Run(() => RunUploadWorkerAsync(i + 1, _backgroundCts.Token)))
@@ -242,8 +231,6 @@ public static class WebDavUploader
             await _backgroundCts.CancelAsync();
             await _scanTask;
             await Task.WhenAll(_uploadWorkerTasks);
-            if (_verificationQueue != null)
-                await _verificationQueue.StopAsync();
             Log.Information("WebDAV background uploader stopped");
         }
         catch (OperationCanceledException)
@@ -371,7 +358,6 @@ public static class WebDavUploader
 
         string baseUrl;
         var enabled = _enabled;
-        var verificationQueue = _verificationQueue;
 
         lock (StateLock)
         {
@@ -399,17 +385,7 @@ public static class WebDavUploader
             // 按文件大小分发到不同策略
             if (fileInfo.Length >= UploadConstants.LargeFileThresholdBytes)
             {
-                if (verificationQueue == null)
-                {
-                    Log.Warning(
-                        "Verification queue not available, falling back to small file uploader for large file: {FileName}",
-                        fileInfo.Name);
-                    await SmallFileUploader.ProcessAsync(filePath, baseUrl, cancellationToken);
-                }
-                else
-                {
-                    await LargeFileUploader.ProcessAsync(filePath, baseUrl, verificationQueue, cancellationToken);
-                }
+                await LargeFileUploader.ProcessAsync(filePath, baseUrl, cancellationToken);
             }
             else
             {

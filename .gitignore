@@ -402,6 +402,8 @@ CLAUDE.md
 CONTEXT.md
 docs/
 architecture-review-*.html
+.semgrep/
 
 # macOS
 .DS_Store
+AGENTS.md

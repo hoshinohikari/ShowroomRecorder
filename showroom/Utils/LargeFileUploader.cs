@@ -8,12 +8,11 @@ namespace showroom.Utils;
 /// <summary>
 ///     大文件上传策略（>= UploadConstants.LargeFileThresholdBytes）。
 ///     特点：分块 PATCH 串行上传 + 抽检校验 + 进度持久化 + 僵死检测 + 指数退避重试。
-///     校验通过后加入后台全量校验队列，最终确认后删本地文件。
+///     抽检通过后即删除本地文件。
 /// </summary>
 internal static class LargeFileUploader
 {
-    public static async Task ProcessAsync(string filePath, string baseUrl,
-        BackgroundVerificationQueue verificationQueue, CancellationToken cancellationToken)
+    public static async Task ProcessAsync(string filePath, string baseUrl, CancellationToken cancellationToken)
     {
         var fileInfo = new FileInfo(filePath);
         string? targetUrl = null;
@@ -26,22 +25,9 @@ internal static class LargeFileUploader
                 return;
             }
 
-            // 文件已在后台全量 hash 校验队列中（大文件上传后由抽检通过进入后台校验）。
-            // 此时不应重复上传/重复入队/重复检测，直接跳过，等待后台校验完成后再由扫描器决定。
-            if (verificationQueue.Contains(filePath))
-            {
-                Log.Debug(
-                    "WebDAV large upload skipped, file already in background verification queue: {FileName}",
-                    fileInfo.Name);
-                return;
-            }
-
             targetUrl = UploadHelpers.BuildTargetUrl(baseUrl, fileInfo.Name);
             Log.Information("WebDAV large upload starting: {FileName}, size={SizeGB:F2} GB",
                 fileInfo.Name, fileInfo.Length / (1024.0 * 1024 * 1024));
-
-            // 预计算本地 hash（后台算，上传过程中并行）
-            var localHashTask = Task.Run(() => UploadHelpers.ComputeSha256HexAsync(filePath), cancellationToken);
 
             // 加载进度（如果有）
             var progress = await LoadProgressAsync(filePath);
@@ -103,28 +89,18 @@ internal static class LargeFileUploader
 
             Log.Information("WebDAV large upload sample verify passed: {FileName}", fileInfo.Name);
 
-            // 等待本地 hash 计算完成（应该早就算完了）
-            string? localHash = null;
+            // 抽检通过，删除本地文件（远端已完整且抽样一致）。
+            // 删除失败则保留本地文件，等扫描器下次捡起重试。
             try
             {
-                localHash = await localHashTask.WaitAsync(TimeSpan.FromMinutes(1), cancellationToken);
+                File.Delete(filePath);
+                Log.Information("WebDAV large upload sample verify passed, deleted local file: {FilePath}",
+                    filePath);
             }
             catch (Exception ex)
             {
-                Log.Warning(ex, "Local hash not ready in time for {FileName}", fileInfo.Name);
-            }
-
-            // 加入后台全量校验队列
-            if (!string.IsNullOrEmpty(localHash))
-            {
-                verificationQueue.Enqueue(targetUrl, filePath, localHash);
-                Log.Debug("WebDAV large file queued for background verification: {FileName}", fileInfo.Name);
-            }
-            else
-            {
-                // 本地 hash 算不出来就不删文件，保持原样
-                Log.Warning("WebDAV large upload skipped background verification (no local hash): {FileName}",
-                    fileInfo.Name);
+                Log.Warning(ex, "Failed to delete local file after large upload sample verify: {FilePath}",
+                    filePath);
             }
         }
         catch (OperationCanceledException)
