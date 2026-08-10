@@ -145,9 +145,10 @@ internal sealed class BackgroundVerificationQueue : IDisposable
             return false;
         }
 
-        // 请求服务端 hash（短超时，快速探测）
-        var remoteHash = await UploadHelpers.TryGetRemoteSha256Async(
-            item.TargetUrl, UploadConstants.ServerHashQuickTimeoutMs);
+        // 请求服务端 hash。超时按本地文件大小动态估算（服务端需读文件算 hash，超大文件固定短超时会误判超时）
+        var fileSize = new FileInfo(item.LocalFilePath).Length;
+        var hashTimeoutMs = UploadHelpers.EstimateServerHashTimeoutMs(fileSize);
+        var remoteHash = await UploadHelpers.TryGetRemoteSha256Async(item.TargetUrl, hashTimeoutMs);
 
         if (!string.IsNullOrWhiteSpace(remoteHash))
         {

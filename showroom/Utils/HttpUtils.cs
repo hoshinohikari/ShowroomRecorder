@@ -209,6 +209,13 @@ public static class WebDavHttp
         return await client.DownloadStream(resolvedResource, param, timeoutMs);
     }
 
+    public static async Task<(HttpStatusCode Status, byte[] Bytes)> DownloadRange(string resource, long offset,
+        int count, double? timeoutMs = null)
+    {
+        var (client, resolvedResource) = ResolveClientAndResource(resource);
+        return await client.DownloadRange(resolvedResource, offset, count, timeoutMs);
+    }
+
     public static async Task<HttpStatusCode> PutBytes(string resource, byte[] payload, string contentType,
         double? timeoutMs = null)
     {
@@ -647,6 +654,55 @@ public class HttpUtils
         {
             Log.Error(ex, "HTTP DELETE failed: resource={Resource}", resource);
             return HttpStatusCode.ServiceUnavailable;
+        }
+    }
+
+    /// <summary>
+    ///     下载远端文件的指定字节范围，返回状态码与读到的字节。
+    ///     相比 DownloadFile（整响应读入内存），这里流式地只读取 count 字节即停止。
+    ///     若服务端不支持 Range（返回 200 而非 206），调用方可通过 status 判断并降级/跳过。
+    /// </summary>
+    public async Task<(HttpStatusCode Status, byte[] Bytes)> DownloadRange(string resource, long offset, int count,
+        double? timeoutMs = null)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, resource);
+            request.Version = _preferredHttpVersion;
+            request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+            AddDefaultHeaders(request, false);
+            request.Headers.TryAddWithoutValidation("Range", $"bytes={offset}-{offset + count - 1}");
+
+            using var cts = new CancellationTokenSource(GetTimeout(timeoutMs));
+            using var response =
+                await _streamingClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+            // 服务端支持 Range 时应返回 206 Partial Content；返回其它状态（如 200 整文件）视为不支持
+            if (response.StatusCode != HttpStatusCode.PartialContent)
+            {
+                Log.Verbose("HTTP Range unsupported: resource={Resource}, status={Status}", resource,
+                    response.StatusCode);
+                return (response.StatusCode, Array.Empty<byte>());
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            var buffer = new byte[count];
+            var totalRead = 0;
+            while (totalRead < count)
+            {
+                var n = await stream.ReadAsync(buffer.AsMemory(totalRead), cts.Token);
+                if (n == 0) break;
+                totalRead += n;
+            }
+
+            if (totalRead == count)
+                return (response.StatusCode, buffer);
+            return (response.StatusCode, buffer.AsMemory(0, totalRead).ToArray());
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "HTTP Range download failed: resource={Resource}", resource);
+            return (HttpStatusCode.ServiceUnavailable, Array.Empty<byte>());
         }
     }
 

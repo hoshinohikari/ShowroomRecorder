@@ -34,6 +34,15 @@ internal static class UploadConstants
     /// <summary>服务端 hash 请求短超时（快速路径探测用）。</summary>
     public const double ServerHashQuickTimeoutMs = 30000;
 
+    /// <summary>服务端计算 hash 的保守速度下限（MB/s），用于按文件大小估算单次 hash 请求超时。</summary>
+    public const double ServerHashSpeedFloorMBps = 64;
+
+    /// <summary>按文件大小估算的 hash 请求超时基础开销（毫秒）。</summary>
+    public const double ServerHashBaseTimeoutMs = 30000;
+
+    /// <summary>按文件大小估算的 hash 请求超时上限（毫秒），防止超大文件长时间占用 worker。</summary>
+    public const double ServerHashMaxTimeoutMs = 30 * 60 * 1000; // 30 min
+
     /// <summary>服务端 hash 最大重试次数（后台校验用）。</summary>
     public const int ServerHashMaxRetries = 12; // 12 * 5min = 1h
 
@@ -86,6 +95,21 @@ internal static class UploadHelpers
         {
             Log.Warning(ex, "WebDAV timestamp sync failed: {FileName}", localFileInfo.Name);
         }
+    }
+
+    /// <summary>
+    ///     按文件大小保守估算服务端计算 SHA256 所需的单次请求超时（毫秒）。
+    ///     服务端拿到请求后才开始读文件算 hash，超大文件需时随大小增长，
+    ///     固定短超时会误判为"不可用"。按 128 MB/s 保守下限 + 基础开销估算，并设上限封顶。
+    /// </summary>
+    public static double EstimateServerHashTimeoutMs(long fileSizeBytes)
+    {
+        if (fileSizeBytes <= 0)
+            return UploadConstants.ServerHashQuickTimeoutMs;
+
+        var hashingSeconds = fileSizeBytes / (UploadConstants.ServerHashSpeedFloorMBps * 1024 * 1024);
+        var timeoutMs = UploadConstants.ServerHashBaseTimeoutMs + hashingSeconds * 1000.0;
+        return Math.Min(timeoutMs, UploadConstants.ServerHashMaxTimeoutMs);
     }
 
     /// <summary>
@@ -213,10 +237,20 @@ internal static class UploadHelpers
             if (localRead == 0) continue;
             var localSlice = localBuffer.AsMemory(0, localRead);
 
-            // 读远端（HTTP Range），用流式读取而非 DownloadFile。
-            // DownloadFile 会把整个响应读进内存：若服务端忽略 Range 头返回整个文件，
-            // 大文件会直接 OOM（ReadAsBytes -> MemoryStream.EnsureCapacity）。流式只读所需字节即可。
-            var remoteBytes = await ReadRemoteRangeAsync(targetUrl, offset, localRead);
+            // 读远端（HTTP Range）
+            var (remoteStatus, remoteBytes) = await WebDavHttp.DownloadRange(targetUrl, offset, localRead, 30000);
+
+            // 服务端不支持 Range（返回 200 整文件而非 206 Partial Content）：
+            // 抽检无法定位到目标偏移，继续下去只会假失败。此时跳过抽检，
+            // 大文件的最终完整性由后台全量 hash 校验队列保证。
+            if (remoteStatus != HttpStatusCode.PartialContent)
+            {
+                Log.Warning(
+                    "WebDAV server does not support Range (status={Status}), skipping sample verify for {FileName}. Backend full-hash verification will cover integrity.",
+                    remoteStatus, localFileInfo.Name);
+                return true;
+            }
+
             if (remoteBytes.Length != localRead)
             {
                 Log.Warning(
@@ -237,45 +271,6 @@ internal static class UploadHelpers
         Log.Debug("WebDAV sample verify passed: {FileName}, samples={SampleCount}, bytesPerSample={SampleBytes}",
             localFileInfo.Name, sampleCount, sampleByteCount);
         return true;
-    }
-
-    /// <summary>
-    ///     流式读取远端指定范围 [offset, offset+count) 的字节。
-    ///     相比 DownloadFile（整响应读入内存），当服务端忽略 Range 头返回整个文件时，
-    ///     这里只读取前 count 字节就停止，避免大文件 OOM。服务端不支持 Range 时会退化为读取文件开头。
-    /// </summary>
-    private static async Task<byte[]> ReadRemoteRangeAsync(string targetUrl, long offset, int count)
-    {
-        var rangeEnd = offset + count - 1;
-        var rangeHeader = new List<(string, string)>
-        {
-            ("Range", $"bytes={offset}-{rangeEnd}")
-        };
-
-        var stream = await WebDavHttp.DownloadStream(targetUrl, rangeHeader, 30000);
-        if (stream == null)
-            return Array.Empty<byte>();
-
-        try
-        {
-            var buffer = new byte[count];
-            var totalRead = 0;
-            while (totalRead < count)
-            {
-                var n = await stream.ReadAsync(buffer.AsMemory(totalRead));
-                if (n == 0) break;
-                totalRead += n;
-            }
-
-            // 只保留实际读到的字节
-            if (totalRead == count)
-                return buffer;
-            return buffer.AsMemory(0, totalRead).ToArray();
-        }
-        finally
-        {
-            await stream.DisposeAsync();
-        }
     }
 
     private static List<long> GenerateSampleOffsets(long fileSize, int sampleCount, int sampleByteCount)
