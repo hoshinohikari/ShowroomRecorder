@@ -8,7 +8,7 @@ using HttpStatusCode = System.Net.HttpStatusCode;
 namespace showroom.Download;
 
 /// <summary>消费信道，独占段下载：去重、缓存、并发信号量、重试。下载字节写入共享缓存供 merger 合并。</summary>
-public sealed class SegmentDownloader(string name, string playlistUrl, PipelineState state)
+public sealed class SegmentDownloader
 {
     private const int MaxCachedSegments = 256;
     private const int MaxActiveTasks = 20;
@@ -17,17 +17,19 @@ public sealed class SegmentDownloader(string name, string playlistUrl, PipelineS
 
     private static readonly Regex SequenceNumberRegex = new(@"-(\d+)\.ts", RegexOptions.Compiled);
 
-    private readonly string _name = name;
-    private readonly PipelineState _state = state;
+    private readonly string _name;
+    private readonly PipelineState _state;
     private readonly SemaphoreSlim _downloadSemaphore = new(MaxConcurrentDownloads);
-    private readonly Func<string, Task<byte[]>> _downloadFile = null!;
+    private readonly Func<string, Task<byte[]>> _downloadFile;
 
-    private readonly Uri? _playlistUri = Uri.TryCreate(playlistUrl, UriKind.Absolute, out var uri) ? uri : null;
+    private readonly Uri? _playlistUri;
 
     public SegmentDownloader(string name, string playlistUrl, PipelineState state,
         Func<string, Task<byte[]>>? downloadFile = null)
-        : this(name, playlistUrl, state)
     {
+        _name = name;
+        _state = state;
+        _playlistUri = Uri.TryCreate(playlistUrl, UriKind.Absolute, out var uri) ? uri : null;
         _downloadFile = downloadFile ?? (r => ShowroomDownloadHttp.DownloadFile(r, [], 2000));
     }
 
@@ -107,7 +109,7 @@ public sealed class SegmentDownloader(string name, string playlistUrl, PipelineS
             return resolved.ToString();
 
         throw new InvalidOperationException(
-            $"Cannot resolve segment URL from path '{pathOrUrl}'. Playlist URL: '{playlistUrl}'.");
+            $"Cannot resolve segment URL from path '{pathOrUrl}'. Playlist URL: '{_playlistUri}'.");
     }
 
     private async Task DownloadSegmentAsync(M3u8Media segment, CancellationToken ct)

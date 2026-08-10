@@ -19,14 +19,14 @@ public readonly record struct MergeEvent(
     long Sequence = -1);
 
 /// <summary>连续性/滚动状态机：从共享缓存按序号合并，经 FileSink 写文件，输出各阶段事件。</summary>
-public sealed class SegmentMerger(string name, IFileSinkFactory sinkFactory, PipelineState state)
+public sealed class SegmentMerger
 {
     private const int NonContinuousRetryLimit = 3;
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(2);
 
-    private readonly string _name = name;
-    private readonly IFileSinkFactory _sinkFactory = sinkFactory;
-    private readonly PipelineState _state = state;
+    private readonly string _name;
+    private readonly IFileSinkFactory _sinkFactory;
+    private readonly PipelineState _state;
     private readonly TimeSpan _pollInterval;
 
     private IFileSink _currentSink = null!;
@@ -36,8 +36,10 @@ public sealed class SegmentMerger(string name, IFileSinkFactory sinkFactory, Pip
 
     public SegmentMerger(string name, IFileSinkFactory sinkFactory, PipelineState state,
         TimeSpan? pollInterval = null)
-        : this(name, sinkFactory, state)
     {
+        _name = name;
+        _sinkFactory = sinkFactory;
+        _state = state;
         _pollInterval = pollInterval ?? DefaultPollInterval;
     }
 
