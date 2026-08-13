@@ -53,6 +53,21 @@ internal static class LargeFileUploader
                 }
             }
 
+            // 部分 WebDAV 服务端（如 dufs）的 PATCH append 不能自建文件，
+            // 对不存在的资源会直接报错断连。远端明确缺失时先 PUT 建一个空文件，
+            // 让后续 append 有可挂载的目标。PUT 是 WebDAV 通用原语，各服务端均支持。
+            // 仅对明确的 404 操作，避免误截断已存在的远端文件。
+            if (headStatus == HttpStatusCode.NotFound)
+            {
+                var createStatus = await WebDavHttp.PutBytes(targetUrl, [], "application/octet-stream");
+                if ((int)createStatus is >= 200 and < 300)
+                    Log.Debug("WebDAV pre-created remote file via PUT: {FileName}", fileInfo.Name);
+                else
+                    Log.Warning(
+                        "WebDAV pre-create PUT failed (status={Status}), append may still create if supported: {FileName}",
+                        createStatus, fileInfo.Name);
+            }
+
             // 上传分块
             if (uploadedBytes < fileInfo.Length)
             {
