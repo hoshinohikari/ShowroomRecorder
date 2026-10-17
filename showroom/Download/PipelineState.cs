@@ -12,6 +12,28 @@ namespace showroom.Download;
 public sealed class PipelineState : IDisposable
 {
     private const int MaxQueuedSegments = 128;
+    private TaskCompletionSource? _streamReset;
+
+    internal bool IsStreamResetRequested => Volatile.Read(ref _streamReset) != null;
+
+    // Downloader has drained its in-flight requests before asking Merger to close the old stream.
+    internal async Task RequestStreamResetAsync(CancellationToken ct)
+    {
+        var request = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _streamReset, request, null) != null)
+            throw new InvalidOperationException("A stream reset is already pending.");
+
+        try
+        {
+            await request.Task.WaitAsync(ct);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _streamReset, null, request);
+        }
+    }
+
+    internal void CompleteStreamReset() => Interlocked.Exchange(ref _streamReset, null)?.TrySetResult();
 
     /// <summary>段信道：Fetcher 写，Downloader 读。</summary>
     public Channel<M3u8Media> Segments { get; } =

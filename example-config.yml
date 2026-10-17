@@ -8,6 +8,8 @@ WebDavUsername: "" # 可留空，留空时尝试匿名访问
 WebDavPassword: "" # 可留空；若填写账号或密码任一项则使用 Basic 认证
 WebDavAllowInsecureCertificate: false # 是否允许忽略 WebDAV 的无效/自签名 TLS 证书
 Downloader: none
+WebRtc:
+  NativeLibraryPath: "" # WebRTC 原生共享库目录；留空使用系统库搜索路径，仅 WebRTC 模式检查
 Users: 
 - user1
 - user2

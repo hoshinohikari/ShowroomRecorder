@@ -56,6 +56,20 @@ public sealed class SegmentMerger
                 if (_state.DownloadedSegmentsCache.Count > 0)
                     await MergePendingAsync(ct);
 
+                if (_state.IsStreamResetRequested && _state.DownloadedSegmentsCache.IsEmpty)
+                {
+                    var completedFilePath = _currentSink.FilePath;
+                    await _currentSink.FlushAsync(ct);
+                    await _currentSink.DisposeAsync();
+                    Emit(MergeEventKind.Rotated, completedFilePath, "stream sequence reset");
+
+                    _currentSink = await _sinkFactory.CreateNewAsync(ct);
+                    _lastSequenceNumber = -1;
+                    _waitingForSequence = -1;
+                    _nonContinuousRetryCount = 0;
+                    _state.CompleteStreamReset();
+                }
+
                 await Task.Delay(_pollInterval, ct);
             }
 

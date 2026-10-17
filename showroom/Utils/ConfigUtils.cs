@@ -16,8 +16,15 @@ public class Configs
     public string WebDavPassword { get; set; } = "";
     public bool WebDavAllowInsecureCertificate { get; set; } = false;
     public string Downloader { get; set; } = "none";
+    public WebRtcConfigs WebRtc { get; set; } = new();
     public string[] Users { get; set; } = [];
     public string SrId { get; set; } = "";
+}
+
+public class WebRtcConfigs
+{
+    // Optional native shared-library directory. Empty uses the system library search path.
+    public string NativeLibraryPath { get; set; } = "";
 }
 
 public static class ConfigUtils

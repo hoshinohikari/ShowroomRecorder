@@ -38,6 +38,9 @@ public sealed class SegmentDownloader
         try
         {
             var activeTasks = new List<Task>();
+            var retiredStreams = new HashSet<string>(StringComparer.Ordinal);
+            var currentStreams = new HashSet<string>(StringComparer.Ordinal);
+            long highestSequence = -1;
 
             while (!ct.IsCancellationRequested)
             {
@@ -51,6 +54,35 @@ public sealed class SegmentDownloader
 
                 while (_state.Segments.Reader.TryRead(out var segment))
                 {
+                    var sequence = ExtractSequenceNumber(segment.Path);
+                    var identity = GetStreamIdentity(segment.Path);
+                    if (retiredStreams.Contains(identity))
+                    {
+                        _state.QueuedSegments.TryRemove(segment.Path, out _);
+                        continue;
+                    }
+
+                    if (sequence >= 0)
+                    {
+                        if (currentStreams.Count > 0 && !currentStreams.Contains(identity) && sequence < highestSequence)
+                        {
+                            // No old request may publish into the cache after Merger resets its sequence.
+                            await Task.WhenAll(activeTasks).WaitAsync(ct);
+                            activeTasks.Clear();
+                            Log.Information(
+                                "{Name} stream identity changed with sequence reset: last={LastSequence}, current={Sequence}",
+                                _name, highestSequence, sequence);
+                            await _state.RequestStreamResetAsync(ct);
+                            _state.DownloadedSegments.Clear();
+                            retiredStreams.UnionWith(currentStreams);
+                            currentStreams.Clear();
+                            highestSequence = -1;
+                        }
+
+                        currentStreams.Add(identity);
+                        highestSequence = Math.Max(highestSequence, sequence);
+                    }
+
                     await _downloadSemaphore.WaitAsync(ct);
 
                     var downloadTask = Task.Run(async () =>
@@ -110,6 +142,18 @@ public sealed class SegmentDownloader
 
         throw new InvalidOperationException(
             $"Cannot resolve segment URL from path '{pathOrUrl}'. Playlist URL: '{_playlistUri}'.");
+    }
+
+    private string GetStreamIdentity(string path)
+    {
+        var uri = new Uri(ResolveSegmentUrl(path));
+        var streamSequence = uri.Query.TrimStart('?').Split('&')
+            .FirstOrDefault(part => part.StartsWith("txspiseq=", StringComparison.Ordinal));
+
+        // Showroom can reuse the same path after a restart, but changes txspiseq.
+        // Ignore CDN host and authentication query changes, which do not identify a new stream.
+        return SequenceNumberRegex.Replace(uri.AbsolutePath, "-{sequence}.ts") +
+               (streamSequence == null ? string.Empty : "?" + streamSequence);
     }
 
     private async Task DownloadSegmentAsync(M3u8Media segment, CancellationToken ct)
