@@ -1,131 +1,180 @@
-using System.Net;
-using System.Text.Json;
 using Serilog;
 using showroom.Download;
 using showroom.Utils;
+using showroom.WebRtc;
 
 namespace showroom;
 
-public class Recorder(string name, long id)
+public class Recorder
 {
+    private readonly string _name;
+    private readonly long _id;
+    private readonly Configs _configSnapshot;
+    private readonly IRecorderBackendFactory _backendFactory;
+    private readonly IWebRtcRecordingLifecycle _webRtcLifecycle;
+    private readonly object _lifecycleLock = new();
     private DownloadUtils? _download;
+    private Task? _downloadTask;
+    private IWebRtcSegmentEventSource? _segmentEventSource;
+    private bool _stopRequested;
 
-    //private string _viewUrl = null!;
-    private string _recordUrl = string.Empty;
-
-    private async Task GetUrls()
+    public Recorder(string name, long id)
+        : this(name, id, ConfigUtils.Config, new RecorderBackendFactory(), new WebRtcRecordingLifecycle())
     {
-        Log.Verbose("{Name} requesting streaming_url for room {RoomId}", name, id);
-        var res = await ShowroomHttp.Get("api/live/streaming_url",
-        [
-            ("room_id", $"{id}"),
-            ("_",
-                $"{new DateTimeOffset(DateTime.UtcNow).ToUnixTimeSeconds() * 1000 + DateTimeOffset.UtcNow.Millisecond}"),
+    }
 
-            ("abr_available", "1")
-        ]);
-
-        if (res.Item1 != HttpStatusCode.OK || string.IsNullOrWhiteSpace(res.Item2))
-        {
-            Log.Warning("{Name} GetUrls failed: {Status}", name, res.Item1);
-            _recordUrl = string.Empty;
-            return;
-        }
-
-        Log.Verbose("{Name} GetUrls response length: {Length}", name, res.Item2.Length);
-
-        if (res.Item2 == "{}")
-        {
-            Log.Warning("{Name} streaming_url response is empty object", name);
-            _recordUrl = string.Empty;
-            return;
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(res.Item2);
-            var root = document.RootElement;
-
-            if (!root.TryGetProperty("streaming_url_list", out var streams) || streams.ValueKind != JsonValueKind.Array)
-            {
-                Log.Warning("{Name} streaming_url_list missing or invalid", name);
-                _recordUrl = string.Empty;
-                return;
-            }
-
-            foreach (var stream in streams.EnumerateArray().Where(stream =>
-                         stream.GetProperty("type").GetString() == "hls" &&
-                         stream.GetProperty("label").GetString() == "original quality"))
-            {
-                _recordUrl = stream.GetProperty("url").GetString()!;
-                break;
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "{Name} failed to parse streaming_url response", name);
-            _recordUrl = string.Empty;
-        }
+    internal Recorder(
+        string name,
+        long id,
+        Configs configSnapshot,
+        IRecorderBackendFactory backendFactory,
+        IWebRtcRecordingLifecycle webRtcLifecycle)
+    {
+        _name = name;
+        _id = id;
+        _configSnapshot = CopyConfig(configSnapshot);
+        _backendFactory = backendFactory;
+        _webRtcLifecycle = webRtcLifecycle;
     }
 
     public async Task Start()
     {
-        Log.Debug("{Name} recorder start", name);
-        await GetUrls();
+        Log.Debug("{Name} recorder start using protocol {Protocol}", _name, _configSnapshot.Protocol);
 
-        if (_recordUrl == string.Empty)
+        DownloadUtils? downloader;
+        switch (_configSnapshot.Protocol)
         {
-            Log.Warning("{Name} record URL not found, skip this round", name);
-            await Task.Delay(ConfigUtils.Interval);
-            return;
-        }
-
-        Log.Information("{Name} record URL resolved", name);
-        //Log.Information($"{_name} view url is {_viewUrl}");
-
-        switch (ConfigUtils.Config.Downloader)
-        {
-            case "minyami":
-                _download = new Minyami(name, _recordUrl);
-                Log.Debug("{Name} using downloader: minyami", name);
+            case "hls":
+                downloader = await _backendFactory.CreateHlsAsync(_name, _id, _configSnapshot).ConfigureAwait(false);
+                if (downloader is null)
+                {
+                    Log.Warning("{Name} original-quality HLS URL not found, skip this round", _name);
+                    if (!IsStopRequested())
+                        await Task.Delay(TimeSpan.FromSeconds(_configSnapshot.Interval)).ConfigureAwait(false);
+                    return;
+                }
                 break;
-            case "streamlink":
-                _download = new StreamlinkUtils(name, _recordUrl);
-                Log.Debug("{Name} using downloader: streamlink", name);
-                break;
-            case "ffmpeg":
-                _download = new FFmpegUtils(name, _recordUrl);
-                Log.Debug("{Name} using downloader: ffmpeg", name);
+            case "webrtc":
+                // Deliberately bypass HLS URL resolution and downloader selection completely.
+                downloader = _backendFactory.CreateWebRtc(_name, _id, _configSnapshot);
                 break;
             default:
-                _download = new ShowroomUtils(name, _recordUrl);
-                Log.Debug("{Name} using downloader: showroom", name);
-                break;
+                throw new InvalidOperationException(
+                    $"Unsupported recording protocol '{_configSnapshot.Protocol}'. Expected 'hls' or 'webrtc'.");
         }
 
-        Log.Verbose("{Name} downloader instance type={DownloaderType}", name, _download.GetType().Name);
-        await _download.DownloadAsync();
-        Log.Debug("{Name} recorder end", name);
+        Task downloadTask;
+        lock (_lifecycleLock)
+        {
+            if (_stopRequested)
+            {
+                Log.Debug("{Name} recorder stopped before backend start", _name);
+                return;
+            }
+
+            _download = downloader;
+            if (downloader is IWebRtcSegmentEventSource eventSource)
+            {
+                _segmentEventSource = eventSource;
+                eventSource.SegmentStarted += OnWebRtcSegmentStarted;
+                eventSource.SegmentFinalized += OnWebRtcSegmentFinalized;
+                eventSource.SegmentAborted += OnWebRtcSegmentAborted;
+            }
+
+            // Start under the same lock used by Stop so a stop request cannot race before the
+            // backend has created its cancellation state (notably during WebRTC negotiation).
+            _downloadTask = downloader.DownloadAsync();
+            downloadTask = _downloadTask;
+        }
+
+        try
+        {
+            Log.Verbose("{Name} downloader instance type={DownloaderType}", _name, downloader.GetType().Name);
+            await downloadTask.ConfigureAwait(false);
+            Log.Debug("{Name} recorder end", _name);
+        }
+        finally
+        {
+            DetachSegmentEvents();
+        }
     }
 
     public async Task Stop()
     {
-        if (_download == null)
+        DownloadUtils? downloader;
+        Task? downloadTask;
+        lock (_lifecycleLock)
         {
-            Log.Verbose("{Name} recorder stop skipped: downloader not started", name);
+            _stopRequested = true;
+            downloader = _download;
+            downloadTask = _downloadTask;
+        }
+
+        if (downloader is null)
+        {
+            Log.Verbose("{Name} recorder stop skipped: downloader not started", _name);
             return;
         }
 
-        Log.Debug("{Name} recorder stop requested", name);
+        Log.Debug("{Name} recorder stop requested", _name);
         try
         {
-            await _download.Stop();
+            await downloader.Stop().ConfigureAwait(false);
+            if (downloadTask is not null)
+                await downloadTask.ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "{Name} recorder stop failed", name);
+            Log.Error(ex, "{Name} recorder stop failed", _name);
         }
 
-        Log.Debug("{Name} recorder stopped", name);
+        Log.Debug("{Name} recorder stopped", _name);
     }
+
+    private bool IsStopRequested()
+    {
+        lock (_lifecycleLock)
+            return _stopRequested;
+    }
+
+    private void OnWebRtcSegmentStarted(object? sender, WebRtcSegmentEventArgs args) =>
+        _webRtcLifecycle.OnSegmentStarted(args);
+
+    private void OnWebRtcSegmentFinalized(object? sender, WebRtcSegmentEventArgs args) =>
+        _webRtcLifecycle.OnSegmentFinalized(args);
+
+    private void OnWebRtcSegmentAborted(object? sender, WebRtcSegmentEventArgs args) =>
+        _webRtcLifecycle.OnSegmentAborted(args);
+
+    private void DetachSegmentEvents()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_segmentEventSource is null)
+                return;
+
+            _segmentEventSource.SegmentStarted -= OnWebRtcSegmentStarted;
+            _segmentEventSource.SegmentFinalized -= OnWebRtcSegmentFinalized;
+            _segmentEventSource.SegmentAborted -= OnWebRtcSegmentAborted;
+            _segmentEventSource = null;
+        }
+    }
+
+    private static Configs CopyConfig(Configs config) => new()
+    {
+        Protocol = config.Protocol,
+        DebugLog = config.DebugLog,
+        TraceLog = config.TraceLog,
+        FileLog = config.FileLog,
+        Interval = config.Interval,
+        Proxy = config.Proxy,
+        WebDavUrl = config.WebDavUrl,
+        WebDavUsername = config.WebDavUsername,
+        WebDavPassword = config.WebDavPassword,
+        WebDavAllowInsecureCertificate = config.WebDavAllowInsecureCertificate,
+        Downloader = config.Downloader,
+        WebRtc = new WebRtcConfigs { NativeLibraryPath = config.WebRtc?.NativeLibraryPath ?? string.Empty },
+        Users = config.Users?.ToArray() ?? [],
+        SrId = config.SrId
+    };
 }

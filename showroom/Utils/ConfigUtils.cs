@@ -6,6 +6,7 @@ namespace showroom.Utils;
 
 public class Configs
 {
+    public string Protocol { get; set; } = "hls";
     public bool DebugLog { get; set; } = false;
     public bool TraceLog { get; set; } = false;
     public bool FileLog { get; set; } = false;
@@ -30,6 +31,7 @@ public class WebRtcConfigs
 public static class ConfigUtils
 {
     private const string ConfigFileName = "configs.yml";
+    private static readonly ConfigManager _configManager = new(new showroom.WebRtc.FfmpegWebRtcDependencyPreflight());
     private static readonly CancellationTokenSource _cts = new();
     private static readonly object _configLock = new();
     private static DateTime _lastWriteUtc;
@@ -41,7 +43,7 @@ public static class ConfigUtils
         _ = ReloadLoopAsync();
     }
 
-    public static Configs Config { get; private set; } = new();
+    public static Configs Config => _configManager.Current;
 
     public static TimeSpan Interval => TimeSpan.FromSeconds(Config.Interval);
 
@@ -65,12 +67,12 @@ public static class ConfigUtils
                     .Build();
                 var yaml = serializer.Serialize(defaultConfig);
                 File.WriteAllText(configFilePath, yaml);
-                Config = defaultConfig;
+                _configManager.SetCurrent(defaultConfig);
                 Log.Information("默认配置文件已创建");
             }
             else
             {
-                Config = ParseConfig(configFilePath);
+                _configManager.Load(File.ReadAllText(configFilePath));
                 Log.Debug(
                     "配置文件加载成功: path={ConfigPath}, users={UserCount}, debug={DebugLog}, trace={TraceLog}, fileLog={FileLog}",
                     configFilePath, Config.Users.Length, Config.DebugLog, Config.TraceLog, Config.FileLog);
@@ -81,30 +83,6 @@ public static class ConfigUtils
             Log.Error($"配置文件解析错误: {ex.Message}");
             Environment.Exit(1); // 退出程序
         }
-    }
-
-    private static Configs ParseConfig(string configFilePath)
-    {
-        var configStr = File.ReadAllText(configFilePath);
-        var deserializer = new DeserializerBuilder()
-            .WithNamingConvention(NullNamingConvention.Instance)
-            .Build();
-        var cfg = deserializer.Deserialize<Configs>(configStr);
-
-        // 去重 Users，忽略空值
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var deduped = new List<string>(cfg.Users.Length);
-        foreach (var user in cfg.Users)
-        {
-            if (string.IsNullOrWhiteSpace(user))
-                continue;
-            if (seen.Add(user))
-                deduped.Add(user);
-            else
-                Log.Warning("重复用户已忽略: {User}", user);
-        }
-        cfg.Users = deduped.ToArray();
-        return cfg;
     }
 
     private static async Task ReloadLoopAsync()
@@ -139,12 +117,20 @@ public static class ConfigUtils
 
         try
         {
-            var newConfig = ParseConfig(ConfigFilePath);
+            var configYaml = File.ReadAllText(ConfigFilePath);
+            Exception? reloadError;
+            bool reloaded;
             lock (_configLock)
             {
-                Config = newConfig;
-                _lastWriteUtc = lastWrite;
+                reloaded = _configManager.TryReload(configYaml, out reloadError);
+                if (reloaded)
+                    _lastWriteUtc = lastWrite;
             }
+
+            if (!reloaded)
+                throw reloadError!;
+
+            var newConfig = _configManager.Current;
             Log.Information("配置已热重载: users={UserCount}, interval={Interval}s",
                 newConfig.Users.Length, newConfig.Interval);
         }

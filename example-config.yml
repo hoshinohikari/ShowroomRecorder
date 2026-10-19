@@ -1,3 +1,4 @@
+Protocol: hls # 可选：hls 或 webrtc；省略时默认 hls
 DebugLog: false
 TraceLog: false
 FileLog: false
